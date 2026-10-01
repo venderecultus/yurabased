@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import OpenAI from 'openai';
 import { Bot } from 'grammy';
 import { createClient } from '@supabase/supabase-js';
+import { collectFacts, collectNewPeople } from './memory.js';
 
 const telegramToken = process.env.TELEGRAM_BOT_TOKEN;
 const routerApiKey = process.env.OPENROUTER_API_KEY;
@@ -21,6 +22,9 @@ const messagesPerSummary = 20;
 const personalityFiles = ['identity.md', 'style.md', 'vocabulary.md', 'mindset.md', 'preferences.md', 'guardrails.md'];
 const stickers = JSON.parse(await readFile(new URL('../personality/stickers.json', import.meta.url), 'utf8')) as string[];
 const stickerChance = 0.15;
+const unsolicitedMessageChance = 0.03;
+const unsolicitedDelayMinMs = 60_000;
+const unsolicitedDelayMaxMs = 10 * 60_000;
 const pillReaction = '💊';
 const systemPrompt = (
   await Promise.all(
@@ -38,6 +42,66 @@ const ai = new OpenAI({
 });
 
 const memoryRefreshes = new Map<string, Promise<void>>();
+const unsolicitedTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function cancelUnsolicitedMessage(chatId: string) {
+  const timer = unsolicitedTimers.get(chatId);
+  if (timer) clearTimeout(timer);
+  unsolicitedTimers.delete(chatId);
+}
+
+function scheduleUnsolicitedMessage(chatId: string, recentMessage: string) {
+  cancelUnsolicitedMessage(chatId);
+  if (Math.random() >= unsolicitedMessageChance) return;
+
+  const delay = unsolicitedDelayMinMs + Math.random() * (unsolicitedDelayMaxMs - unsolicitedDelayMinMs);
+  const timer = setTimeout(() => {
+    unsolicitedTimers.delete(chatId);
+    void (async () => {
+      try {
+        const [summaryResult, recentResult] = await Promise.all([
+          supabase.from('chat_summaries').select('summary, recent_context').eq('chat_id', chatId).maybeSingle(),
+          supabase.from('messages').select('author_name, content').eq('chat_id', chatId)
+            .order('id', { ascending: false }).limit(5),
+        ]);
+        if (summaryResult.error) throw summaryResult.error;
+        if (recentResult.error) throw recentResult.error;
+        const recentContext = (recentResult.data ?? []).reverse()
+          .map(({ author_name, content }) => `${author_name}: ${content}`).join('\n');
+        const result = await ai.chat.completions.create({
+          model: 'gemini/gemini-3.1-flash-lite-preview',
+          messages: [
+            {
+              role: 'system',
+              content: `${systemPrompt}\n\nYou are starting a new conversation unprompted. Choose either an original topic of your own or naturally pick up something from the recent chat. Write only a short, casual opening message in Yura's voice. Do not mention that this was scheduled or generated.`,
+            },
+            {
+              role: 'user',
+              content: `Recent chat:\n${recentContext || recentMessage}\n\nLong-term summary:\n${summaryResult.data?.summary ?? '(empty)'}\n\nPick your own topic or a topic from the chat, whichever feels natural.`,
+            },
+          ],
+        });
+        const answer = result.choices[0]?.message.content?.trim();
+        if (!answer) return;
+        await bot.api.sendMessage(chatId, answer);
+        const { error } = await supabase.from('messages').insert({
+          chat_id: chatId,
+          user_id: String(bot.botInfo.id),
+          author_name: 'Yura',
+          role: 'assistant',
+          content: answer,
+        });
+        if (error) console.error('Unsolicited message history save failed:', error);
+        else void refreshRecentContext(chatId).catch((refreshError) => console.error('Recent context update failed:', refreshError));
+      } catch (error) {
+        console.error('Unsolicited message failed:', error);
+      }
+    })();
+  }, delay);
+  unsolicitedTimers.set(chatId, timer);
+  // Keep timers from preventing a clean process shutdown in test or maintenance runs.
+  if ('unref' in timer) timer.unref();
+}
 
 function refreshMemory(chatId: string) {
   const running = memoryRefreshes.get(chatId);
@@ -67,10 +131,7 @@ async function refreshMemoryOnce(chatId: string) {
   if (peopleError) throw peopleError;
 
   const knownPeople = people ?? [];
-  const newPeople = pending
-    .filter((message, index, all) => all.findIndex((item) => item.user_id === message.user_id) === index)
-    .filter((message) => !knownPeople.some((person) => person.user_id === message.user_id))
-    .map((message) => ({ chat_id: chatId, user_id: message.user_id, name: message.author_name }));
+  const newPeople = collectNewPeople(pending, knownPeople, chatId);
 
   if (newPeople.length) {
     const { data, error } = await supabase.from('people')
@@ -108,10 +169,7 @@ async function refreshMemoryOnce(chatId: string) {
   }).eq('chat_id', chatId);
   if (saveSummaryError) throw saveSummaryError;
 
-  const facts = (memory.facts ?? []).flatMap(({ user_id, fact }) => {
-    const person = knownPeople.find((entry) => entry.user_id === user_id);
-    return person && fact.trim() ? [{ chat_id: chatId, person_id: person.id, fact: fact.trim() }] : [];
-  });
+  const facts = collectFacts(memory.facts ?? [], knownPeople, chatId);
   if (facts.length) {
     const { error } = await supabase.from('person_facts').insert(facts);
     if (error) throw error;
@@ -210,12 +268,14 @@ bot.on('message', async (ctx) => {
     repliedToBot;
 
   if (!pinged) {
+    scheduleUnsolicitedMessage(chatId, text);
     void saveUserMessage(chatId, userId, authorName, text)
       .catch((error) => console.error('Message save failed:', error));
     return;
   }
 
   const requestStarted = performance.now();
+  cancelUnsolicitedMessage(chatId);
   const timings: Record<string, number> = {};
   try {
     let stageStarted = performance.now();
