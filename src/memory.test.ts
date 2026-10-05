@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { collectFacts, collectNewPeople } from './memory.js';
+import { collectFacts, collectNewFacts, collectNewPeople, selectNonRepeatingAnswer } from './memory.js';
+
+test('selectNonRepeatingAnswer rejects an answer that repeats the recent pattern', () => {
+  assert.equal(selectNonRepeatingAnswer('сам бездарь', ['сам бездарь', 'сам бездарь', 'ладно']), false);
+  assert.equal(selectNonRepeatingAnswer('ну ты и клоун', ['сам бездарь', 'ладно', 'чего']), true);
+});
 
 test('collectNewPeople deduplicates pending users and excludes known users', () => {
   const people = [{ id: 1, user_id: 'known', name: 'Known' }];
@@ -25,5 +30,15 @@ test('collectFacts trims facts and discards unknown people and blank facts', () 
 
   assert.deepEqual(collectFacts(facts, people, 'chat'), [
     { chat_id: 'chat', person_id: 2, fact: 'durable detail' },
+  ]);
+});
+
+test('collectNewFacts deduplicates facts by person identity', () => {
+  assert.deepEqual(collectNewFacts([
+    { person_id: 2, fact: ' likes tea ' },
+    { person_id: 2, fact: 'Likes tea' },
+    { person_id: 3, fact: 'Likes tea' },
+  ], [{ person_id: 2, fact: 'likes tea' }]), [
+    { person_id: 3, fact: 'Likes tea' },
   ]);
 });

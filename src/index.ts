@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import OpenAI from 'openai';
 import { Bot } from 'grammy';
 import { createClient } from '@supabase/supabase-js';
-import { collectFacts, collectNewPeople } from './memory.js';
+import { collectFacts, collectNewFacts, collectNewPeople, selectNonRepeatingAnswer } from './memory.js';
 
 const telegramToken = process.env.TELEGRAM_BOT_TOKEN;
 const routerApiKey = process.env.OPENROUTER_API_KEY;
@@ -18,11 +18,11 @@ if (!telegramToken || !routerApiKey || !openaiBaseUrl || !supabaseUrl || !supaba
 
 const bot = new Bot(telegramToken);
 const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
-const messagesPerSummary = 20;
+const messagesPerSummary = 200;
 const personalityFiles = ['identity.md', 'style.md', 'vocabulary.md', 'mindset.md', 'preferences.md', 'guardrails.md'];
 const stickers = JSON.parse(await readFile(new URL('../personality/stickers.json', import.meta.url), 'utf8')) as string[];
 const stickerChance = 0.15;
-const unsolicitedMessageChance = 0.03;
+const unsolicitedMessageChance = 0.1;
 const unsolicitedDelayMinMs = 60_000;
 const unsolicitedDelayMaxMs = 10 * 60_000;
 const pillReaction = '💊';
@@ -81,7 +81,7 @@ function scheduleUnsolicitedMessage(chatId: string, recentMessage: string) {
             },
           ],
         });
-        const answer = result.choices[0]?.message.content?.trim();
+        const answer = result.choices?.[0]?.message.content?.trim();
         if (!answer) return;
         await bot.api.sendMessage(chatId, answer);
         const { error } = await supabase.from('messages').insert({
@@ -158,25 +158,37 @@ async function refreshMemoryOnce(chatId: string) {
       },
     ],
   });
-  const memory = JSON.parse(result.choices[0]?.message.content ?? '{}') as {
+  const memory = JSON.parse(result.choices?.[0]?.message.content ?? '{}') as {
     summary?: string;
     facts?: { user_id: string; fact: string }[];
   };
 
-  const { error: saveSummaryError } = await supabase.from('chat_summaries').update({
+  const { error: saveSummaryError } = await supabase.from('chat_summaries').upsert({
+    chat_id: chatId,
     summary: memory.summary ?? oldSummary?.summary ?? '',
     updated_at: new Date().toISOString(),
-  }).eq('chat_id', chatId);
+  }, { onConflict: 'chat_id' });
   if (saveSummaryError) throw saveSummaryError;
 
   const facts = collectFacts(memory.facts ?? [], knownPeople, chatId);
   if (facts.length) {
-    const { error } = await supabase.from('person_facts').insert(facts);
-    if (error) throw error;
+    const personIds = [...new Set(facts.map(({ person_id }) => person_id))];
+    const { data: existingFacts, error: existingFactsError } = await supabase.from('person_facts')
+      .select('person_id, fact').eq('chat_id', chatId).in('person_id', personIds);
+    if (existingFactsError) throw existingFactsError;
+    const newFacts = collectNewFacts(facts, existingFacts ?? []);
+    if (newFacts.length) {
+      const { error } = await supabase.from('person_facts').insert(newFacts.map(({ person_id, fact }) => ({ chat_id: chatId, person_id, fact })));
+      if (error) throw error;
+    }
   }
 
+  await markPendingMessages(chatId, pending.map(({ id }) => id));
+}
+
+async function markPendingMessages(chatId: string, messageIds: number[]) {
   const { error: markError } = await supabase.from('messages')
-    .update({ summarized_at: new Date().toISOString() }).in('id', pending.map(({ id }) => id));
+    .update({ summarized_at: new Date().toISOString() }).eq('chat_id', chatId).in('id', messageIds);
   if (markError) throw markError;
 }
 
@@ -289,9 +301,7 @@ bot.on('message', async (ctx) => {
 
     const [summaryResult, factsResult, recentContext] = await Promise.all([
       supabase.from('chat_summaries').select('summary, recent_context').eq('chat_id', chatId).maybeSingle(),
-      supabase.from('person_facts').select('fact, people!inner(name, user_id)').eq('chat_id', chatId)
-        .eq('people.user_id', userId)
-        .order('id', { ascending: false }).limit(12),
+      supabase.from('people').select('id, name').eq('chat_id', chatId).eq('user_id', userId).maybeSingle(),
       getRecentContext(chatId, incomingMessage.id),
     ]);
     timings.memory = Math.round(performance.now() - stageStarted);
@@ -299,25 +309,33 @@ bot.on('message', async (ctx) => {
     if (factsResult.error) console.error('Facts load failed:', factsResult.error);
 
     stageStarted = performance.now();
-    const knownFacts = (factsResult.data ?? []).map((row) => {
-      const person = row.people as unknown as { name: string } | null;
-      return `${person?.name ?? 'unknown'}: ${row.fact}`;
-    }).join('\n') || '(none)';
-    const result = await ai.chat.completions.create({
-      model: 'gemini/gemini-3.1-flash-lite-preview',
-      messages: [
-        {
-          role: 'system',
-          content: `${systemPrompt}\n\nOngoing chat context (recent messages):\n${recentContext || '(empty)'}\n\nLong-term chat summary:\n${summaryResult.data?.summary ?? '(empty)'}\n\nKnown facts about this user:\n${knownFacts}`,
-        },
-        {
-          role: 'user',
-          content: `${authorName}: ${text}\n\nIf the user's message is genuinely hilarious, append the exact marker [[PILL_REACTION]] at the very end of your response. Otherwise do not append it. Judge laughter-worthy humor strictly; don't mark mildly amusing messages.`,
-        },
-      ],
-    });
+    const person = factsResult.data;
+    const { data: storedFacts, error: storedFactsError } = person
+      ? await supabase.from('person_facts').select('fact').eq('chat_id', chatId).eq('person_id', person.id)
+        .order('id', { ascending: false }).limit(5)
+      : { data: [], error: null };
+    if (storedFactsError) console.error('Facts load failed:', storedFactsError);
+    const knownFacts = (storedFacts ?? []).map(({ fact }) => fact).join('\n') || '(none)';
+    const { data: recentAnswers, error: recentAnswersError } = await supabase.from('messages')
+      .select('content').eq('chat_id', chatId).eq('user_id', String(ctx.me.id)).eq('role', 'assistant')
+      .order('id', { ascending: false }).limit(20);
+    if (recentAnswersError) console.error('Recent answers load failed:', recentAnswersError);
+    const prompt = [
+      { role: 'system' as const, content: `${systemPrompt}\n\nRecent context:\n${recentContext || '(empty)'}\n\nLong-term summary:\n${summaryResult.data?.summary ?? '(empty)'}\n\nKnown facts about this user:\n${knownFacts}\n\nAvoid repeating the wording, insult, joke, or comeback from your recent answers. Prefer a fresh, calm response. If the user's message is genuinely hilarious, append [[PILL_REACTION]] at the very end; otherwise omit it.` },
+      { role: 'user' as const, content: `${authorName}: ${text}` },
+    ];
+    let rawAnswer: string | undefined;
+    const recentAnswerList = (recentAnswers ?? []).map(({ content }) => content);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const result = await ai.chat.completions.create({ model: 'gemini/gemini-3.1-flash-lite-preview', messages: prompt });
+      const candidate = result.choices?.[0]?.message.content?.trim();
+      if (candidate) rawAnswer = candidate;
+      if (candidate && selectNonRepeatingAnswer(candidate, recentAnswerList)) {
+        break;
+      }
+      if (attempt < 2) prompt[0].content += '\nThe previous draft was too similar to a recent reply. Write a distinctly different response, changing both the wording and response approach.';
+    }
     timings.model = Math.round(performance.now() - stageStarted);
-    const rawAnswer = result.choices[0]?.message.content?.trim();
     const pillReactionRequested = rawAnswer?.endsWith('[[PILL_REACTION]]') ?? false;
     const answer = rawAnswer?.replace(/\s*\[\[PILL_REACTION\]\]$/, '').trim();
     if (!answer) {
