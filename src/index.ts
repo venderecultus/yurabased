@@ -81,7 +81,7 @@ function scheduleUnsolicitedMessage(chatId: string, recentMessage: string) {
         const recentContext = (recentResult.data ?? []).reverse()
           .map(({ author_name, content }) => `${author_name}: ${content}`).join('\n');
         const result = await ai.chat.completions.create({
-          model: 'gemini/gemini-3.1-flash-lite-preview',
+          model: 'kr/claude-sonnet-4.5',
           messages: [
             {
               role: 'system',
@@ -153,7 +153,7 @@ async function refreshMemoryOnce(chatId: string) {
   }
 
   const result = await ai.chat.completions.create({
-    model: 'gemini/gemini-3.1-flash-lite-preview',
+    model: 'kr/claude-sonnet-4.5',
     response_format: { type: 'json_object' },
     messages: [
       {
@@ -364,20 +364,22 @@ bot.on('message', async (ctx) => {
     if (recentAnswersError) console.error('Recent answers load failed:', recentAnswersError);
     const prompt = [
       { role: 'system' as const, content: `${systemPrompt}\n\nRecent context:\n${recentContext || '(empty)'}\n\nLong-term summary:\n${summaryResult.data?.summary ?? '(empty)'}\n\nKnown facts about this user:\n${knownFacts}\n\nAvoid repeating the wording, insult, joke, or comeback from your recent answers. Respond freshly and match the group's current tone. If the user's message is genuinely hilarious, append [[PILL_REACTION]] at the very end; otherwise omit it.` },
-      { role: 'user' as const, content: mediaFile
-        ? [
-          { type: 'text' as const, text: `${authorName}: ${messageText}` },
-          ...(photo ? [{ type: 'image_url' as const, image_url: { url: `data:image/jpeg;base64,${(await getTelegramFile(ctx.api, photo.file_id)).toString('base64')}` } }] : []),
-          ...(voice ? [{ type: 'text' as const, text: `Voice transcription: ${await ai.audio.transcriptions.create({ file: new File([await getTelegramFile(ctx.api, voice.file_id)], 'voice.ogg', { type: voice.mime_type }), model: 'whisper-1' }).then(({ text }) => text)}` }] : []),
-        ]
-        : `${authorName}: ${messageText}` },
+      {
+        role: 'user' as const, content: mediaFile
+          ? [
+            { type: 'text' as const, text: `${authorName}: ${messageText}` },
+            ...(photo ? [{ type: 'image_url' as const, image_url: { url: `data:image/jpeg;base64,${(await getTelegramFile(ctx.api, photo.file_id)).toString('base64')}` } }] : []),
+            ...(voice ? [{ type: 'text' as const, text: `Voice transcription: ${await ai.audio.transcriptions.create({ file: new File([await getTelegramFile(ctx.api, voice.file_id)], 'voice.ogg', { type: voice.mime_type }), model: 'whisper-1' }).then(({ text }) => text)}` }] : []),
+          ]
+          : `${authorName}: ${messageText}`
+      },
     ];
     let rawAnswer: string | undefined;
     const recentAnswerList = (recentAnswers ?? []).map(({ content }) => content);
     for (let attempt = 0; attempt < 3; attempt++) {
       let result: OpenAI.Chat.Completions.ChatCompletion;
       try {
-        result = await ai.chat.completions.create({ model: 'gemini/gemini-3.1-flash-lite-preview', messages: prompt as OpenAI.Chat.Completions.ChatCompletionMessageParam[] });
+        result = await ai.chat.completions.create({ model: 'kr/claude-sonnet-4.5', messages: prompt as OpenAI.Chat.Completions.ChatCompletionMessageParam[] });
       } catch (error) {
         if (!mediaFile) throw error;
         console.error('Media understanding unavailable:', error);
