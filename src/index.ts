@@ -41,6 +41,18 @@ const ai = new OpenAI({
   maxRetries: 1,
 });
 
+function escapeHtml(value: string) {
+  return value.replace(/[&<>"']/gu, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]!);
+}
+
+async function getTelegramFile(api: Bot['api'], fileId: string) {
+  const file = await api.getFile(fileId);
+  if (!file.file_path) throw new Error('Telegram file path unavailable');
+  const response = await fetch(`https://api.telegram.org/file/bot${telegramToken}/${file.file_path}`);
+  if (!response.ok) throw new Error(`Telegram file download failed: ${response.status}`);
+  return Buffer.from(await response.arrayBuffer());
+}
+
 const memoryRefreshes = new Map<string, Promise<void>>();
 const unsolicitedTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
@@ -73,7 +85,7 @@ function scheduleUnsolicitedMessage(chatId: string, recentMessage: string) {
           messages: [
             {
               role: 'system',
-              content: `${systemPrompt}\n\nYou are starting a new conversation unprompted. Choose either an original topic of your own or naturally pick up something from the recent chat. Write only a short, casual opening message in Yura's voice. Do not mention that this was scheduled or generated.`,
+              content: `${systemPrompt}\n\nYou are joining the chat unprompted. Prefer a concise, funny reaction to what people are currently discussing; if there is no useful opening, introduce one distinct topic of your own. Do not bring up Yura's last invoked subject unless the chat itself is discussing it. Avoid repeating recent Yura messages. Write only a short opening in Yura's voice; do not mention that this was scheduled or generated.`,
             },
             {
               role: 'user',
@@ -234,9 +246,38 @@ bot.on('message', async (ctx) => {
   if (!message) return;
   const replyOptions = { reply_parameters: { message_id: message.message_id } };
   const text = 'text' in message ? message.text : undefined;
+  const photo = 'photo' in message ? message.photo?.at(-1) : undefined;
+  const voice = 'voice' in message ? message.voice : undefined;
+  const mediaFile = photo ?? voice;
   const repliedToBot = message.reply_to_message?.from?.id === ctx.me.id;
 
-  if (!text) {
+  if (text?.match(/^\/call(?:@\w+)?(?:\s|$)/iu)) {
+    if (ctx.chat.type !== 'group' && ctx.chat.type !== 'supergroup') {
+      await ctx.reply('работает только в группе', replyOptions);
+      return;
+    }
+    const { data: members, error } = await supabase.from('people').select('user_id, name')
+      .eq('chat_id', String(ctx.chat.id));
+    if (error) {
+      console.error('/call member lookup failed:', error);
+      await ctx.reply('не смог достать список участников', replyOptions);
+      return;
+    }
+    const uniqueMembers = [...new Map((members ?? [])
+      .filter(({ user_id }) => user_id !== String(ctx.me.id))
+      .map((member) => [member.user_id, member])).values()];
+    if (!uniqueMembers.length) {
+      await ctx.reply('пока никого не знаю в этом чате; список набирается по сообщениям', replyOptions);
+      return;
+    }
+    const mentions = uniqueMembers.map(({ user_id, name }) =>
+      `<a href="tg://user?id=${encodeURIComponent(user_id)}">${escapeHtml(name)}</a>`,
+    ).join(' ');
+    await ctx.reply(mentions, { ...replyOptions, parse_mode: 'HTML' });
+    return;
+  }
+
+  if (!text && !mediaFile) {
     if (repliedToBot) {
       const sticker = stickers[Math.floor(Math.random() * stickers.length)];
       try {
@@ -259,7 +300,7 @@ bot.on('message', async (ctx) => {
   const userId = String(ctx.from.id);
   const authorName = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ') || ctx.from.username || userId;
   const botUsername = ctx.me.username;
-  if (/^юра\s+лизав\??\s*$/iu.test(text.trim())) {
+  if (text && /^юра\s+лизав\??\s*$/iu.test(text.trim())) {
     const { error } = await supabase.from('chat_summaries').upsert({
       chat_id: chatId,
       summary: '',
@@ -275,13 +316,14 @@ bot.on('message', async (ctx) => {
     return;
   }
 
-  const pinged = /(^|[^\p{L}\p{N}_])(?:юри[йя]|юр(?:а+|е|у|ой|ьем)?|хуюра|юрадаун|yura)(?=$|[^\p{L}\p{N}_])/iu.test(text) ||
-    (botUsername && text.toLowerCase().includes(`@${botUsername.toLowerCase()}`)) ||
+  const messageText = text ?? (photo ? (message.caption ?? '[image]') : '[voice message]');
+  const pinged = Boolean(mediaFile) || /(^|[^\p{L}\p{N}_])(?:юри[йя]|юр(?:а+|е|у|ой|ьем)?|хуюра|юрадаун|yura)(?=$|[^\p{L}\p{N}_])/iu.test(messageText) ||
+    (botUsername && messageText.toLowerCase().includes(`@${botUsername.toLowerCase()}`)) ||
     repliedToBot;
 
   if (!pinged) {
-    scheduleUnsolicitedMessage(chatId, text);
-    void saveUserMessage(chatId, userId, authorName, text)
+    scheduleUnsolicitedMessage(chatId, messageText);
+    void saveUserMessage(chatId, userId, authorName, messageText)
       .catch((error) => console.error('Message save failed:', error));
     return;
   }
@@ -292,7 +334,7 @@ bot.on('message', async (ctx) => {
   try {
     let stageStarted = performance.now();
     const { data: incomingMessage, error: incomingError } = await supabase.from('messages').insert({
-      chat_id: chatId, user_id: userId, author_name: authorName, role: 'user', content: text,
+      chat_id: chatId, user_id: userId, author_name: authorName, role: 'user', content: messageText,
     }).select('id').single();
     if (incomingError) throw incomingError;
     await refreshRecentContext(chatId);
@@ -321,13 +363,27 @@ bot.on('message', async (ctx) => {
       .order('id', { ascending: false }).limit(20);
     if (recentAnswersError) console.error('Recent answers load failed:', recentAnswersError);
     const prompt = [
-      { role: 'system' as const, content: `${systemPrompt}\n\nRecent context:\n${recentContext || '(empty)'}\n\nLong-term summary:\n${summaryResult.data?.summary ?? '(empty)'}\n\nKnown facts about this user:\n${knownFacts}\n\nAvoid repeating the wording, insult, joke, or comeback from your recent answers. Prefer a fresh, calm response. If the user's message is genuinely hilarious, append [[PILL_REACTION]] at the very end; otherwise omit it.` },
-      { role: 'user' as const, content: `${authorName}: ${text}` },
+      { role: 'system' as const, content: `${systemPrompt}\n\nRecent context:\n${recentContext || '(empty)'}\n\nLong-term summary:\n${summaryResult.data?.summary ?? '(empty)'}\n\nKnown facts about this user:\n${knownFacts}\n\nAvoid repeating the wording, insult, joke, or comeback from your recent answers. Respond freshly and match the group's current tone. If the user's message is genuinely hilarious, append [[PILL_REACTION]] at the very end; otherwise omit it.` },
+      { role: 'user' as const, content: mediaFile
+        ? [
+          { type: 'text' as const, text: `${authorName}: ${messageText}` },
+          ...(photo ? [{ type: 'image_url' as const, image_url: { url: `data:image/jpeg;base64,${(await getTelegramFile(ctx.api, photo.file_id)).toString('base64')}` } }] : []),
+          ...(voice ? [{ type: 'text' as const, text: `Voice transcription: ${await ai.audio.transcriptions.create({ file: new File([await getTelegramFile(ctx.api, voice.file_id)], 'voice.ogg', { type: voice.mime_type }), model: 'whisper-1' }).then(({ text }) => text)}` }] : []),
+        ]
+        : `${authorName}: ${messageText}` },
     ];
     let rawAnswer: string | undefined;
     const recentAnswerList = (recentAnswers ?? []).map(({ content }) => content);
     for (let attempt = 0; attempt < 3; attempt++) {
-      const result = await ai.chat.completions.create({ model: 'gemini/gemini-3.1-flash-lite-preview', messages: prompt });
+      let result: OpenAI.Chat.Completions.ChatCompletion;
+      try {
+        result = await ai.chat.completions.create({ model: 'gemini/gemini-3.1-flash-lite-preview', messages: prompt as OpenAI.Chat.Completions.ChatCompletionMessageParam[] });
+      } catch (error) {
+        if (!mediaFile) throw error;
+        console.error('Media understanding unavailable:', error);
+        rawAnswer = voice ? 'не смог разобрать голосовое — похоже, модель сейчас не поддерживает аудио' : 'не смог разобрать картинку — похоже, модель сейчас не поддерживает изображения';
+        break;
+      }
       const candidate = result.choices?.[0]?.message.content?.trim();
       if (candidate) rawAnswer = candidate;
       if (candidate && selectNonRepeatingAnswer(candidate, recentAnswerList)) {

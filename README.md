@@ -74,6 +74,8 @@ alter table public.chat_summaries add column if not exists recent_context text n
 
 Set `SUPABASE_URL` and the project's `SUPABASE_SERVICE_ROLE_KEY` in `.env`. The service-role key is secret and must never be exposed to users or committed. All incoming text and Yura's replies are stored with their authors. Every 200 unsummarized message records, Yura updates the long-term summary and extracts explicit facts linked to Telegram user IDs via `people.id`; `people` is unique per `(chat_id, user_id)`. A separate rolling context stores the last six chat messages and is refreshed on every message. Each reply receives the recent context, long-term summary, up to five facts for the current Telegram user, personality instructions, and the current message—not the raw full history. Repetition is checked against recent bot replies; near-duplicates trigger up to two regeneration attempts. Send `юра лизав?` to clear the chat summary and rolling context; raw logs and people facts remain intact.
 
+In group chats, `/call` mentions members Yura has seen in chat messages; Telegram does not let bots enumerate all group members. Photos are downloaded and sent as inline image data; voice messages are transcribed through the configured OpenAI-compatible endpoint using `whisper-1`. Vision/audio support depends on provider capabilities, with a short fallback if unavailable.
+
 To send `здарова.)` to a chat after each bot startup, set `STARTUP_CHAT_ID` to that Telegram chat's ID. The bot must already have permission to send messages there. Leave it unset to disable the greeting.
 
 ## Run on Oracle Cloud VM
