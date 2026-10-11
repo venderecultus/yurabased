@@ -22,9 +22,9 @@ const messagesPerSummary = 200;
 const personalityFiles = ['identity.md', 'style.md', 'vocabulary.md', 'mindset.md', 'preferences.md', 'guardrails.md'];
 const stickers = JSON.parse(await readFile(new URL('../personality/stickers.json', import.meta.url), 'utf8')) as string[];
 const stickerChance = 0.15;
-const unsolicitedMessageChance = 0.1;
+const unsolicitedMessageChance = 0.2;
 const unsolicitedDelayMinMs = 60_000;
-const unsolicitedDelayMaxMs = 10 * 60_000;
+const unsolicitedDelayMaxMs = 5 * 60_000;
 const pillReaction = '💊';
 const systemPrompt = (
   await Promise.all(
