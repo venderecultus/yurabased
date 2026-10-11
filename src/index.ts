@@ -317,9 +317,10 @@ bot.on('message', async (ctx) => {
   }
 
   const messageText = text ?? (photo ? (message.caption ?? '[image]') : '[voice message]');
-  const pinged = Boolean(mediaFile) || /(^|[^\p{L}\p{N}_])(?:юри[йя]|юр(?:а+|е|у|ой|ьем)?|хуюра|юрадаун|yura)(?=$|[^\p{L}\p{N}_])/iu.test(messageText) ||
+  const explicitlyAddressed = /(^|[^\p{L}\p{N}_])(?:юри[йя]|юр(?:а+|е|у|ой|ьем)?|хуюра|юрадаун|yura)(?=$|[^\p{L}\p{N}_])/iu.test(messageText) ||
     (botUsername && messageText.toLowerCase().includes(`@${botUsername.toLowerCase()}`)) ||
     repliedToBot;
+  const pinged = explicitlyAddressed || (Boolean(mediaFile) && Math.random() < 0.05);
 
   if (!pinged) {
     scheduleUnsolicitedMessage(chatId, messageText);
