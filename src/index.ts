@@ -81,7 +81,7 @@ function scheduleUnsolicitedMessage(chatId: string, recentMessage: string) {
         const recentContext = (recentResult.data ?? []).reverse()
           .map(({ author_name, content }) => `${author_name}: ${content}`).join('\n');
         const result = await ai.chat.completions.create({
-          model: 'kr/claude-sonnet-4.5',
+          model: 'gemini/gemini-3.1-flash-lite-preview',
           messages: [
             {
               role: 'system',
@@ -153,7 +153,7 @@ async function refreshMemoryOnce(chatId: string) {
   }
 
   const result = await ai.chat.completions.create({
-    model: 'kr/claude-sonnet-4.5',
+    model: 'gemini/gemini-3.1-flash-lite-preview',
     response_format: { type: 'json_object' },
     messages: [
       {
@@ -379,7 +379,7 @@ bot.on('message', async (ctx) => {
     for (let attempt = 0; attempt < 3; attempt++) {
       let result: OpenAI.Chat.Completions.ChatCompletion;
       try {
-        result = await ai.chat.completions.create({ model: 'kr/claude-sonnet-4.5', messages: prompt as OpenAI.Chat.Completions.ChatCompletionMessageParam[] });
+        result = await ai.chat.completions.create({ model: 'gemini/gemini-3.1-flash-lite-preview', messages: prompt as OpenAI.Chat.Completions.ChatCompletionMessageParam[] });
       } catch (error) {
         if (!mediaFile) throw error;
         console.error('Media understanding unavailable:', error);
