@@ -467,6 +467,7 @@ bot.on('message_reaction_count', async (ctx) => {
 
 bot.catch((error) => console.error('Telegram update failed:', error));
 await bot.start({
+  drop_pending_updates: true,
   allowed_updates: ['message', 'message_reaction', 'message_reaction_count'],
   onStart: async () => {
     if (!startupChatId) {
