@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import OpenAI from 'openai';
 import { Bot } from 'grammy';
 import { createClient } from '@supabase/supabase-js';
-import { collectFacts, collectNewFacts, collectNewPeople, selectNonRepeatingAnswer } from './memory.js';
+import { collectFacts, collectNewFacts, collectNewPeople } from './memory.js';
 
 const telegramToken = process.env.TELEGRAM_BOT_TOKEN;
 const routerApiKey = process.env.OPENROUTER_API_KEY;
@@ -26,6 +26,7 @@ const unsolicitedMessageChance = 0.2;
 const unsolicitedDelayMinMs = 60_000;
 const unsolicitedDelayMaxMs = 5 * 60_000;
 const unsolicitedRequestTimeoutMs = 20_000;
+const replyRequestTimeoutMs = 15_000;
 const pillReaction = '💊';
 const systemPrompt = (
   await Promise.all(
@@ -360,10 +361,6 @@ bot.on('message', async (ctx) => {
       : { data: [], error: null };
     if (storedFactsError) console.error('Facts load failed:', storedFactsError);
     const knownFacts = (storedFacts ?? []).map(({ fact }) => fact).join('\n') || '(none)';
-    const { data: recentAnswers, error: recentAnswersError } = await supabase.from('messages')
-      .select('content').eq('chat_id', chatId).eq('user_id', String(ctx.me.id)).eq('role', 'assistant')
-      .order('id', { ascending: false }).limit(20);
-    if (recentAnswersError) console.error('Recent answers load failed:', recentAnswersError);
     const prompt = [
       { role: 'system' as const, content: `${systemPrompt}\n\nRecent context:\n${recentContext || '(empty)'}\n\nLong-term summary:\n${summaryResult.data?.summary ?? '(empty)'}\n\nKnown facts about this user:\n${knownFacts}\n\nAvoid repeating the wording, insult, joke, or comeback from your recent answers. Respond freshly and match the group's current tone. If the user's message is genuinely hilarious, append [[PILL_REACTION]] at the very end; otherwise omit it.` },
       {
@@ -377,23 +374,17 @@ bot.on('message', async (ctx) => {
       },
     ];
     let rawAnswer: string | undefined;
-    const recentAnswerList = (recentAnswers ?? []).map(({ content }) => content);
-    for (let attempt = 0; attempt < 3; attempt++) {
-      let result: OpenAI.Chat.Completions.ChatCompletion;
-      try {
-        result = await ai.chat.completions.create({ model: 'gemini/gemini-3.1-flash-lite-preview', messages: prompt as OpenAI.Chat.Completions.ChatCompletionMessageParam[] });
-      } catch (error) {
-        if (!mediaFile) throw error;
-        console.error('Media understanding unavailable:', error);
-        rawAnswer = voice ? 'не смог разобрать голосовое — похоже, модель сейчас не поддерживает аудио' : 'не смог разобрать картинку — похоже, модель сейчас не поддерживает изображения';
-        break;
-      }
-      const candidate = result.choices?.[0]?.message.content?.trim();
-      if (candidate) rawAnswer = candidate;
-      if (candidate && selectNonRepeatingAnswer(candidate, recentAnswerList)) {
-        break;
-      }
-      if (attempt < 2) prompt[0].content += '\nThe previous draft was too similar to a recent reply. Write a distinctly different response, changing both the wording and response approach.';
+    try {
+      const result = await ai.chat.completions.create({
+        model: 'gemini/gemini-3.1-flash-lite-preview',
+        messages: prompt as OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+        max_tokens: 180,
+      }, { timeout: replyRequestTimeoutMs, maxRetries: 0 });
+      rawAnswer = result.choices?.[0]?.message.content?.trim();
+    } catch (error) {
+      if (!mediaFile) throw error;
+      console.error('Media understanding unavailable:', error);
+      rawAnswer = voice ? 'не смог разобрать голосовое — похоже, модель сейчас не поддерживает аудио' : 'не смог разобрать картинку — похоже, модель сейчас не поддерживает изображения';
     }
     timings.model = Math.round(performance.now() - stageStarted);
     const pillReactionRequested = rawAnswer?.endsWith('[[PILL_REACTION]]') ?? false;
