@@ -28,6 +28,7 @@ const unsolicitedDelayMaxMs = 5 * 60_000;
 const unsolicitedRequestTimeoutMs = 20_000;
 const replyRequestTimeoutMs = 15_000;
 const pillReaction = '💊';
+const aiModel = 'gemini/gemini-3.5-flash-lite';
 const systemPrompt = (
   await Promise.all(
     personalityFiles.map(async (file) => {
@@ -45,6 +46,14 @@ const ai = new OpenAI({
 
 function escapeHtml(value: string) {
   return value.replace(/[&<>"']/gu, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]!);
+}
+
+function describeError(error: unknown) {
+  if (error instanceof OpenAI.APIError) {
+    const cause = error.cause instanceof Error ? ` cause=${error.cause.message}` : '';
+    return `${error.name}: ${error.message}${error.status ? ` status=${error.status}` : ''}${cause}`;
+  }
+  return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
 }
 
 async function getTelegramFile(api: Bot['api'], fileId: string) {
@@ -83,7 +92,7 @@ function scheduleUnsolicitedMessage(chatId: string, recentMessage: string) {
         const recentContext = (recentResult.data ?? []).reverse()
           .map(({ author_name, content }) => `${author_name}: ${content}`).join('\n');
         const result = await ai.chat.completions.create({
-          model: 'gemini/gemini-3.1-flash-lite-preview',
+          model: aiModel,
           messages: [
             {
               role: 'system',
@@ -108,7 +117,7 @@ function scheduleUnsolicitedMessage(chatId: string, recentMessage: string) {
         if (error) console.error('Unsolicited message history save failed:', error);
         else void refreshRecentContext(chatId).catch((refreshError) => console.error('Recent context update failed:', refreshError));
       } catch (error) {
-        console.error('Unsolicited message failed:', error);
+        console.error('Unsolicited message failed:', describeError(error));
       }
     })();
   }, delay);
@@ -376,14 +385,14 @@ bot.on('message', async (ctx) => {
     let rawAnswer: string | undefined;
     try {
       const result = await ai.chat.completions.create({
-        model: 'gemini/gemini-3.1-flash-lite-preview',
+        model: aiModel,
         messages: prompt as OpenAI.Chat.Completions.ChatCompletionMessageParam[],
         max_tokens: 180,
       }, { timeout: replyRequestTimeoutMs, maxRetries: 0 });
       rawAnswer = result.choices?.[0]?.message.content?.trim();
     } catch (error) {
       if (!mediaFile) throw error;
-      console.error('Media understanding unavailable:', error);
+      console.error('Media understanding unavailable:', describeError(error));
       rawAnswer = voice ? 'не смог разобрать голосовое — похоже, модель сейчас не поддерживает аудио' : 'не смог разобрать картинку — похоже, модель сейчас не поддерживает изображения';
     }
     timings.model = Math.round(performance.now() - stageStarted);
@@ -418,7 +427,7 @@ bot.on('message', async (ctx) => {
     console.log('Reply timings (ms):', { ...timings, total: Math.round(performance.now() - requestStarted) });
   } catch (error) {
     console.log('Failed reply timings (ms):', { ...timings, total: Math.round(performance.now() - requestStarted) });
-    console.error('Message handling failed:', error);
+    console.error('Message handling failed:', describeError(error));
     await ctx.reply('не смог ответить, глянь логи', replyOptions);
   }
 
