@@ -25,6 +25,7 @@ const stickerChance = 0.15;
 const unsolicitedMessageChance = 0.2;
 const unsolicitedDelayMinMs = 60_000;
 const unsolicitedDelayMaxMs = 5 * 60_000;
+const unsolicitedRequestTimeoutMs = 20_000;
 const pillReaction = '💊';
 const systemPrompt = (
   await Promise.all(
@@ -92,7 +93,7 @@ function scheduleUnsolicitedMessage(chatId: string, recentMessage: string) {
               content: `Recent chat:\n${recentContext || recentMessage}\n\nLong-term summary:\n${summaryResult.data?.summary ?? '(empty)'}\n\nPick your own topic or a topic from the chat, whichever feels natural.`,
             },
           ],
-        });
+        }, { timeout: unsolicitedRequestTimeoutMs, maxRetries: 0 });
         const answer = result.choices?.[0]?.message.content?.trim();
         if (!answer) return;
         await bot.api.sendMessage(chatId, answer);
@@ -158,7 +159,7 @@ async function refreshMemoryOnce(chatId: string) {
     messages: [
       {
         role: 'system',
-        content: 'Update long-term chat memory. Return JSON: {"summary":"...", "facts":[{"user_id":"...", "fact":"..."}]}. Summary max 100 words; preserve durable context and decisions. Extract only explicit, useful, non-sensitive facts about people. Do not infer. user_id must match an author in messages. Ignore temporary chatter.',
+        content: 'Update long-term chat memory. Return JSON: {"summary":"...", "facts":[{"user_id":"...", "fact":"..."}]}. Summary max 100 words; preserve durable context and decisions. Extract only explicit, useful, non-sensitive facts about people. Do not infer. user_id must match an author in messages. Ignore temporary chatter. Preserve this established relationship in the summary when relevant: Slavic (Славик) is Yura’s only true friend; Slavic is a robot running an LLM familiar to Yura, and Yura jokes that they came from the same factory and the same machine. Treat this as fictional/persona lore, not a claim about a real-world person.',
       },
       {
         role: 'user',
