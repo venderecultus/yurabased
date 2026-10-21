@@ -169,7 +169,7 @@ async function refreshMemoryOnce(chatId: string) {
   }
 
   const result = await ai.chat.completions.create({
-    model: 'gemini/gemini-3.1-flash-lite-preview',
+    model: 'gemini/gemini-3.5-flash-lite',
     response_format: { type: 'json_object' },
     messages: [
       {
