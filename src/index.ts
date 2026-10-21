@@ -62,6 +62,7 @@ async function getTelegramFile(api: Bot['api'], fileId: string) {
 }
 
 const memoryRefreshes = new Map<string, Promise<void>>();
+const memoryRefreshRetryAt = new Map<string, number>();
 const unsolicitedTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 function cancelUnsolicitedMessage(chatId: string) {
@@ -124,9 +125,16 @@ function scheduleUnsolicitedMessage(chatId: string, recentMessage: string) {
 }
 
 function refreshMemory(chatId: string) {
+  if ((memoryRefreshRetryAt.get(chatId) ?? 0) > Date.now()) return Promise.resolve();
   const running = memoryRefreshes.get(chatId);
   if (running) return running;
-  const refresh = refreshMemoryOnce(chatId).finally(() => memoryRefreshes.delete(chatId));
+  const refresh = refreshMemoryOnce(chatId)
+    .then(() => { memoryRefreshRetryAt.delete(chatId); })
+    .catch((error) => {
+      memoryRefreshRetryAt.set(chatId, Date.now() + 60 * 60 * 1000);
+      throw error;
+    })
+    .finally(() => memoryRefreshes.delete(chatId));
   memoryRefreshes.set(chatId, refresh);
   return refresh;
 }
@@ -178,10 +186,25 @@ async function refreshMemoryOnce(chatId: string) {
       },
     ],
   });
-  const memory = JSON.parse(result.choices?.[0]?.message.content ?? '{}') as {
+  const content = result.choices?.[0]?.message.content?.trim() ?? '';
+  const json = content.match(/```(?:json)?\s*([\s\S]*?)\s*```/iu)?.[1] ?? content;
+  let memory: {
     summary?: string;
     facts?: { user_id: string; fact: string }[];
   };
+  try {
+    memory = JSON.parse(json);
+  } catch {
+    throw new Error('Memory model returned invalid JSON');
+  }
+  if (typeof memory.summary !== 'undefined' && typeof memory.summary !== 'string') {
+    throw new Error('Memory model returned an invalid summary');
+  }
+  if (typeof memory.facts !== 'undefined' && (!Array.isArray(memory.facts) || memory.facts.some(
+    (fact) => !fact || typeof fact.user_id !== 'string' || typeof fact.fact !== 'string',
+  ))) {
+    throw new Error('Memory model returned invalid facts');
+  }
 
   const { error: saveSummaryError } = await supabase.from('chat_summaries').upsert({
     chat_id: chatId,
