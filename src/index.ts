@@ -25,8 +25,6 @@ const stickerChance = 0.15;
 const unsolicitedMessageChance = 0.2;
 const unsolicitedDelayMinMs = 60_000;
 const unsolicitedDelayMaxMs = 5 * 60_000;
-const unsolicitedRequestTimeoutMs = 20_000;
-const replyRequestTimeoutMs = 15_000;
 const pillReaction = '💊';
 const aiModel = 'gemini/gemini-3.5-flash-lite';
 const systemPrompt = (
@@ -40,7 +38,7 @@ const systemPrompt = (
 const ai = new OpenAI({
   baseURL: openaiBaseUrl,
   apiKey: routerApiKey,
-  timeout: 60_000,
+  timeout: Number.POSITIVE_INFINITY,
   maxRetries: 1,
 });
 
@@ -103,7 +101,7 @@ function scheduleUnsolicitedMessage(chatId: string, recentMessage: string) {
               content: `Recent chat:\n${recentContext || recentMessage}\n\nLong-term summary:\n${summaryResult.data?.summary ?? '(empty)'}\n\nPick your own topic or a topic from the chat, whichever feels natural.`,
             },
           ],
-        }, { timeout: unsolicitedRequestTimeoutMs, maxRetries: 0 });
+        });
         const answer = result.choices?.[0]?.message.content?.trim();
         if (!answer) return;
         await bot.api.sendMessage(chatId, answer);
@@ -388,7 +386,7 @@ bot.on('message', async (ctx) => {
         model: aiModel,
         messages: prompt as OpenAI.Chat.Completions.ChatCompletionMessageParam[],
         max_tokens: 180,
-      }, { timeout: replyRequestTimeoutMs, maxRetries: 0 });
+      });
       rawAnswer = result.choices?.[0]?.message.content?.trim();
     } catch (error) {
       if (!mediaFile) throw error;
