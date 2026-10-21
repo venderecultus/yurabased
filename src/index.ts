@@ -38,7 +38,6 @@ const systemPrompt = (
 const ai = new OpenAI({
   baseURL: openaiBaseUrl,
   apiKey: routerApiKey,
-  timeout: Number.POSITIVE_INFINITY,
   maxRetries: 1,
 });
 
