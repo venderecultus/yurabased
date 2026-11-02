@@ -42,9 +42,9 @@ const ai = new OpenAI({
 });
 
 bot.callbackQuery(/^call-setting:(\d+)$/u, async (ctx) => {
+  await ctx.answerCallbackQuery();
   const chatId = String(ctx.chat?.id ?? '');
   if (!chatId || (ctx.chat?.type !== 'group' && ctx.chat?.type !== 'supergroup')) {
-    await ctx.answerCallbackQuery({ text: 'только для групп' });
     return;
   }
   const userId = ctx.match[1];
@@ -52,28 +52,24 @@ bot.callbackQuery(/^call-setting:(\d+)$/u, async (ctx) => {
     .eq('chat_id', chatId).eq('user_id', userId).maybeSingle();
   if (memberError || !member) {
     if (memberError) console.error('Call setting member lookup failed:', memberError);
-    await ctx.answerCallbackQuery({ text: 'участник не найден' });
     return;
   }
   const { data: setting, error: settingError } = await supabase.from('call_settings').select('enabled')
     .eq('chat_id', chatId).eq('user_id', userId).maybeSingle();
   if (settingError) {
     console.error('Call setting lookup failed:', settingError);
-    await ctx.answerCallbackQuery({ text: 'не смог достать настройку' });
     return;
   }
   const enabled = setting?.enabled === false;
   const { error } = await supabase.from('call_settings').upsert({ chat_id: chatId, user_id: userId, enabled }, { onConflict: 'chat_id,user_id' });
   if (error) {
     console.error('Call setting update failed:', error);
-    await ctx.answerCallbackQuery({ text: 'не смог сохранить настройку' });
     return;
   }
   const { data: disabled, error: refreshError } = await supabase.from('call_settings').select('user_id')
     .eq('chat_id', chatId).eq('enabled', false);
   if (refreshError) {
     console.error('Call settings refresh failed:', refreshError);
-    await ctx.answerCallbackQuery({ text: 'сохранено, но список не обновился' });
     return;
   }
   const disabledIds = new Set((disabled ?? []).map(({ user_id }) => user_id));
@@ -86,7 +82,6 @@ bot.callbackQuery(/^call-setting:(\d+)$/u, async (ctx) => {
       callback_data: `call-setting:${id}`,
     }]),
   } });
-  await ctx.answerCallbackQuery({ text: enabled ? 'будет пинговаться' : 'не будет пинговаться в /call' });
 });
 
 function escapeHtml(value: string) {
@@ -624,7 +619,7 @@ bot.on('message_reaction_count', async (ctx) => {
 bot.catch((error) => console.error('Telegram update failed:', error));
 await bot.start({
   drop_pending_updates: true,
-  allowed_updates: ['message', 'message_reaction', 'message_reaction_count'],
+  allowed_updates: ['message', 'callback_query', 'message_reaction', 'message_reaction_count'],
   onStart: async () => {
     if (!startupChatId) {
       console.log('Bot started. Set STARTUP_CHAT_ID to send a startup greeting.');
