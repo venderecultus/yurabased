@@ -41,6 +41,54 @@ const ai = new OpenAI({
   maxRetries: 1,
 });
 
+bot.callbackQuery(/^call-setting:(\d+)$/u, async (ctx) => {
+  const chatId = String(ctx.chat?.id ?? '');
+  if (!chatId || (ctx.chat?.type !== 'group' && ctx.chat?.type !== 'supergroup')) {
+    await ctx.answerCallbackQuery({ text: 'только для групп' });
+    return;
+  }
+  const userId = ctx.match[1];
+  const { data: member, error: memberError } = await supabase.from('people').select('user_id')
+    .eq('chat_id', chatId).eq('user_id', userId).maybeSingle();
+  if (memberError || !member) {
+    if (memberError) console.error('Call setting member lookup failed:', memberError);
+    await ctx.answerCallbackQuery({ text: 'участник не найден' });
+    return;
+  }
+  const { data: setting, error: settingError } = await supabase.from('call_settings').select('enabled')
+    .eq('chat_id', chatId).eq('user_id', userId).maybeSingle();
+  if (settingError) {
+    console.error('Call setting lookup failed:', settingError);
+    await ctx.answerCallbackQuery({ text: 'не смог достать настройку' });
+    return;
+  }
+  const enabled = setting?.enabled === false;
+  const { error } = await supabase.from('call_settings').upsert({ chat_id: chatId, user_id: userId, enabled }, { onConflict: 'chat_id,user_id' });
+  if (error) {
+    console.error('Call setting update failed:', error);
+    await ctx.answerCallbackQuery({ text: 'не смог сохранить настройку' });
+    return;
+  }
+  const { data: disabled, error: refreshError } = await supabase.from('call_settings').select('user_id')
+    .eq('chat_id', chatId).eq('enabled', false);
+  if (refreshError) {
+    console.error('Call settings refresh failed:', refreshError);
+    await ctx.answerCallbackQuery({ text: 'сохранено, но список не обновился' });
+    return;
+  }
+  const disabledIds = new Set((disabled ?? []).map(({ user_id }) => user_id));
+  const { data: members } = await supabase.from('people').select('user_id, name').eq('chat_id', chatId);
+  const uniqueMembers = [...new Map((members ?? []).filter(({ user_id }) => user_id !== String(ctx.me.id))
+    .map((item) => [item.user_id, item])).values()];
+  await ctx.editMessageReplyMarkup({ reply_markup: {
+    inline_keyboard: uniqueMembers.map(({ user_id: id, name }) => [{
+      text: `${disabledIds.has(id) ? '⬜' : '✅'} ${name}`.slice(0, 64),
+      callback_data: `call-setting:${id}`,
+    }]),
+  } });
+  await ctx.answerCallbackQuery({ text: enabled ? 'будет пинговаться' : 'не будет пинговаться в /call' });
+});
+
 function escapeHtml(value: string) {
   return value.replace(/[&<>"']/gu, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]!);
 }
@@ -104,13 +152,14 @@ function scheduleUnsolicitedMessage(chatId: string, recentMessage: string) {
         });
         const answer = result.choices?.[0]?.message.content?.trim();
         if (!answer) return;
-        await bot.api.sendMessage(chatId, answer);
+        const sentMessage = await bot.api.sendMessage(chatId, answer);
         const { error } = await supabase.from('messages').insert({
           chat_id: chatId,
           user_id: String(bot.botInfo.id),
           author_name: 'Yura',
           role: 'assistant',
           content: answer,
+          telegram_message_id: sentMessage.message_id,
         });
         if (error) console.error('Unsolicited message history save failed:', error);
         else void refreshRecentContext(chatId).catch((refreshError) => console.error('Recent context update failed:', refreshError));
@@ -287,8 +336,16 @@ bot.on('message', async (ctx) => {
       await ctx.reply('работает только в группе', replyOptions);
       return;
     }
-    const { data: members, error } = await supabase.from('people').select('user_id, name')
-      .eq('chat_id', String(ctx.chat.id));
+    const [membersResult, settingsResult] = await Promise.all([
+      supabase.from('people').select('user_id, name').eq('chat_id', String(ctx.chat.id)),
+      supabase.from('call_settings').select('user_id').eq('chat_id', String(ctx.chat.id)).eq('enabled', false),
+    ]);
+    const { data: members, error } = membersResult;
+    if (settingsResult.error) {
+      console.error('/call settings lookup failed:', settingsResult.error);
+      await ctx.reply('не смог достать настройки вызова', replyOptions);
+      return;
+    }
     if (error) {
       console.error('/call member lookup failed:', error);
       await ctx.reply('не смог достать список участников', replyOptions);
@@ -297,14 +354,66 @@ bot.on('message', async (ctx) => {
     const uniqueMembers = [...new Map((members ?? [])
       .filter(({ user_id }) => user_id !== String(ctx.me.id))
       .map((member) => [member.user_id, member])).values()];
+    const disabled = new Set((settingsResult.data ?? []).map(({ user_id }) => user_id));
+    const selectedMembers = uniqueMembers.filter(({ user_id }) => !disabled.has(user_id));
+    if (!selectedMembers.length) {
+      await ctx.reply(uniqueMembers.length ? 'никого не выбрано для /call — настрой через /settings' : 'пока никого не знаю в этом чате; список набирается по сообщениям', replyOptions);
+      return;
+    }
+    const mentions = selectedMembers.map(({ user_id, name }) =>
+      `<a href="tg://user?id=${encodeURIComponent(user_id)}">${escapeHtml(name)}</a>`,
+    ).join(' ');
+    await ctx.reply(mentions, { ...replyOptions, parse_mode: 'HTML' });
+    return;
+  }
+
+  if (text?.match(/^\/call-all(?:@\w+)?(?:\s|$)/iu) || text?.match(/^\/settings(?:@\w+)?(?:\s|$)/iu)) {
+    if (ctx.chat.type !== 'group' && ctx.chat.type !== 'supergroup') {
+      await ctx.reply('работает только в группе', replyOptions);
+      return;
+    }
+    const { data: members, error } = await supabase.from('people').select('user_id, name')
+      .eq('chat_id', String(ctx.chat.id));
+    if (error) {
+      console.error('Call member lookup failed:', error);
+      await ctx.reply('не смог достать список участников', replyOptions);
+      return;
+    }
+    const uniqueMembers = [...new Map((members ?? [])
+      .filter(({ user_id }) => user_id !== String(ctx.me.id))
+      .map((member) => [member.user_id, member])).values()];
+    if (text.match(/^\/call-all(?:@\w+)?(?:\s|$)/iu)) {
+      if (!uniqueMembers.length) {
+        await ctx.reply('пока никого не знаю в этом чате; список набирается по сообщениям', replyOptions);
+        return;
+      }
+      const mentions = uniqueMembers.map(({ user_id, name }) =>
+        `<a href="tg://user?id=${encodeURIComponent(user_id)}">${escapeHtml(name)}</a>`,
+      ).join(' ');
+      await ctx.reply(mentions, { ...replyOptions, parse_mode: 'HTML' });
+      return;
+    }
     if (!uniqueMembers.length) {
       await ctx.reply('пока никого не знаю в этом чате; список набирается по сообщениям', replyOptions);
       return;
     }
-    const mentions = uniqueMembers.map(({ user_id, name }) =>
-      `<a href="tg://user?id=${encodeURIComponent(user_id)}">${escapeHtml(name)}</a>`,
-    ).join(' ');
-    await ctx.reply(mentions, { ...replyOptions, parse_mode: 'HTML' });
+    const { data: disabled, error: settingsError } = await supabase.from('call_settings')
+      .select('user_id').eq('chat_id', String(ctx.chat.id)).eq('enabled', false);
+    if (settingsError) {
+      console.error('/settings lookup failed:', settingsError);
+      await ctx.reply('не смог достать настройки вызова', replyOptions);
+      return;
+    }
+    const disabledIds = new Set((disabled ?? []).map(({ user_id }) => user_id));
+    await ctx.reply('кого пинговать командой /call? нажми, чтобы переключить:', {
+      ...replyOptions,
+      reply_markup: {
+        inline_keyboard: uniqueMembers.map(({ user_id, name }) => [{
+          text: `${disabledIds.has(user_id) ? '⬜' : '✅'} ${name}`.slice(0, 64),
+          callback_data: `call-setting:${user_id}`,
+        }]),
+      },
+    });
     return;
   }
 
@@ -373,14 +482,20 @@ bot.on('message', async (ctx) => {
     void refreshMemory(chatId).catch((error) => console.error('Background memory update failed:', error));
     await ctx.replyWithChatAction('typing').catch(() => undefined);
 
-    const [summaryResult, factsResult, recentContext] = await Promise.all([
+    const [summaryResult, factsResult, recentContext, positiveExamplesResult, negativeExamplesResult] = await Promise.all([
       supabase.from('chat_summaries').select('summary, recent_context').eq('chat_id', chatId).maybeSingle(),
       supabase.from('people').select('id, name').eq('chat_id', chatId).eq('user_id', userId).maybeSingle(),
       getRecentContext(chatId, incomingMessage.id),
+      supabase.from('messages').select('content, answer_feedback!inner(rating)').eq('chat_id', chatId).eq('role', 'assistant')
+        .eq('answer_feedback.rating', 'positive').order('id', { ascending: false }).limit(3),
+      supabase.from('messages').select('content, answer_feedback!inner(rating)').eq('chat_id', chatId).eq('role', 'assistant')
+        .eq('answer_feedback.rating', 'negative').order('id', { ascending: false }).limit(3),
     ]);
     timings.memory = Math.round(performance.now() - stageStarted);
     if (summaryResult.error) console.error('Summary load failed:', summaryResult.error);
     if (factsResult.error) console.error('Facts load failed:', factsResult.error);
+    if (positiveExamplesResult.error) console.error('Positive answer examples load failed:', positiveExamplesResult.error);
+    if (negativeExamplesResult.error) console.error('Negative answer examples load failed:', negativeExamplesResult.error);
 
     stageStarted = performance.now();
     const person = factsResult.data;
@@ -390,8 +505,10 @@ bot.on('message', async (ctx) => {
       : { data: [], error: null };
     if (storedFactsError) console.error('Facts load failed:', storedFactsError);
     const knownFacts = (storedFacts ?? []).map(({ fact }) => fact).join('\n') || '(none)';
+    const positiveExamples = (positiveExamplesResult.data ?? []).map(({ content }) => `- ${content}`).join('\n') || '(none)';
+    const negativeExamples = (negativeExamplesResult.data ?? []).map(({ content }) => `- ${content}`).join('\n') || '(none)';
     const prompt = [
-      { role: 'system' as const, content: `${systemPrompt}\n\nRecent context:\n${recentContext || '(empty)'}\n\nLong-term summary:\n${summaryResult.data?.summary ?? '(empty)'}\n\nKnown facts about this user:\n${knownFacts}\n\nAvoid repeating the wording, insult, joke, or comeback from your recent answers. Respond freshly and match the group's current tone. If the user's message is genuinely hilarious, append [[PILL_REACTION]] at the very end; otherwise omit it.` },
+      { role: 'system' as const, content: `${systemPrompt}\n\nRecent context:\n${recentContext || '(empty)'}\n\nLong-term summary:\n${summaryResult.data?.summary ?? '(empty)'}\n\nKnown facts about this user:\n${knownFacts}\n\nExamples of Yura's answers people liked (imitate their tone and qualities, not exact wording):\n${positiveExamples}\n\nExamples of Yura's answers people disliked (avoid their tone and qualities):\n${negativeExamples}\n\nAvoid repeating the wording, insult, joke, or comeback from your recent answers. Respond freshly and match the group's current tone. If the user's message is genuinely hilarious, append [[PILL_REACTION]] at the very end; otherwise omit it.` },
       {
         role: 'user' as const, content: mediaFile
           ? [
@@ -424,7 +541,7 @@ bot.on('message', async (ctx) => {
     }
 
     stageStarted = performance.now();
-    await ctx.reply(answer, replyOptions);
+    const sentMessage = await ctx.reply(answer, replyOptions);
     if (pillReactionRequested && ctx.from.id !== ctx.me.id) {
       await ctx.api.setMessageReaction(ctx.chat.id, message.message_id, [{ type: 'emoji', emoji: pillReaction }])
         .catch((error) => console.error('Pill reaction failed:', error));
@@ -436,7 +553,7 @@ bot.on('message', async (ctx) => {
     timings.telegram = Math.round(performance.now() - stageStarted);
 
     const { error: saveError } = await supabase.from('messages').insert([
-      { chat_id: chatId, user_id: String(ctx.me.id), author_name: 'Yura', role: 'assistant', content: answer },
+      { chat_id: chatId, user_id: String(ctx.me.id), author_name: 'Yura', role: 'assistant', content: answer, telegram_message_id: sentMessage.message_id },
     ]);
     if (saveError) console.error('History save failed:', saveError);
     else {
@@ -456,6 +573,23 @@ bot.on('message', async (ctx) => {
 bot.on('message_reaction', async (ctx) => {
   const { chat, user, message_id: messageId, new_reaction: newReaction } = ctx.messageReaction;
   if (!user || user.id === ctx.me.id || String(chat.type) === 'private') return;
+
+  try {
+    const positive = newReaction.some((reaction) => reaction.type === 'emoji' && ['👍', '❤️', '💊'].includes(reaction.emoji));
+    const negative = newReaction.some((reaction) => reaction.type === 'emoji' && reaction.emoji === '👎');
+    const { data: answer, error: answerError } = await supabase.from('messages').select('id')
+      .eq('chat_id', String(chat.id)).eq('role', 'assistant').eq('telegram_message_id', messageId).maybeSingle();
+    if (answerError) throw answerError;
+    if (answer) {
+      const rating = negative ? 'negative' : positive ? 'positive' : null;
+      const { error } = rating
+        ? await supabase.from('answer_feedback').upsert({ chat_id: String(chat.id), message_id: answer.id, user_id: String(user.id), rating }, { onConflict: 'chat_id,message_id,user_id' })
+        : await supabase.from('answer_feedback').delete().eq('chat_id', String(chat.id)).eq('message_id', answer.id).eq('user_id', String(user.id));
+      if (error) throw error;
+    }
+  } catch (error) {
+    console.error('Answer feedback save failed:', error);
+  }
 
   const pillCount = newReaction.filter((reaction) =>
     reaction.type === 'emoji' && reaction.emoji === pillReaction,

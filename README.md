@@ -21,6 +21,7 @@ create table if not exists public.messages (
   author_name text not null,
   role text not null check (role in ('user', 'assistant')),
   content text not null,
+  telegram_message_id bigint,
   created_at timestamptz not null default now(),
   summarized_at timestamptz
 );
@@ -54,6 +55,24 @@ create table if not exists public.person_facts (
   foreign key (chat_id, person_id) references public.people (chat_id, id) on delete cascade
 );
 
+create table if not exists public.call_settings (
+  chat_id text not null,
+  user_id text not null,
+  enabled boolean not null default true,
+  primary key (chat_id, user_id)
+);
+
+create table if not exists public.answer_feedback (
+  chat_id text not null,
+  message_id bigint not null references public.messages(id) on delete cascade,
+  user_id text not null,
+  rating text not null check (rating in ('positive', 'negative')),
+  created_at timestamptz not null default now(),
+  primary key (chat_id, message_id, user_id)
+);
+
+create index if not exists answer_feedback_rating_idx on public.answer_feedback (chat_id, rating, message_id desc);
+
 create index if not exists person_facts_chat_id_idx on public.person_facts (chat_id, id desc);
 ```
 
@@ -63,6 +82,7 @@ Migration for an existing old `messages` table:
 alter table public.messages add column if not exists user_id text not null default 'unknown';
 alter table public.messages add column if not exists author_name text not null default 'unknown';
 alter table public.messages add column if not exists summarized_at timestamptz;
+alter table public.messages add column if not exists telegram_message_id bigint;
 create table if not exists public.chat_summaries (
   chat_id text primary key,
   summary text not null default '',
@@ -74,7 +94,7 @@ alter table public.chat_summaries add column if not exists recent_context text n
 
 Set `SUPABASE_URL` and the project's `SUPABASE_SERVICE_ROLE_KEY` in `.env`. The service-role key is secret and must never be exposed to users or committed. All incoming text and Yura's replies are stored with their authors. Every 200 unsummarized message records, Yura updates the long-term summary and extracts explicit facts linked to Telegram user IDs via `people.id`; `people` is unique per `(chat_id, user_id)`. A separate rolling context stores the last six chat messages and is refreshed on every message. Each reply receives the recent context, long-term summary, up to five facts for the current Telegram user, personality instructions, and the current message—not the raw full history. Repetition is checked against recent bot replies; near-duplicates trigger up to two regeneration attempts. Send `юра лизав?` to clear the chat summary and rolling context; raw logs and people facts remain intact.
 
-In group chats, `/call` mentions members Yura has seen in chat messages; Telegram does not let bots enumerate all group members. Photos are downloaded and sent as inline image data; voice messages are transcribed through the configured OpenAI-compatible endpoint using `whisper-1`. Vision/audio support depends on provider capabilities, with a short fallback if unavailable.
+In group chats, `/call` mentions members Yura has seen in chat messages; Telegram does not let bots enumerate all group members. `/settings` lets the group choose who `/call` mentions. `/call-all` mentions every known member, ignoring those settings. React to Yura's message with 👍, ❤️, or 💊 to save it as a positive style example; 👎 saves it as a negative example. Examples are shared within the chat and included in future reply prompts. Photos are downloaded and sent as inline image data; voice messages are transcribed through the configured OpenAI-compatible endpoint using `whisper-1`. Vision/audio support depends on provider capabilities, with a short fallback if unavailable.
 
 To send `здарова.)` to a chat after each bot startup, set `STARTUP_CHAT_ID` to that Telegram chat's ID. The bot must already have permission to send messages there. Leave it unset to disable the greeting.
 
