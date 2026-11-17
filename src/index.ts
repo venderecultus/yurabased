@@ -6,14 +6,14 @@ import { createClient } from '@supabase/supabase-js';
 import { collectFacts, collectNewFacts, collectNewPeople } from './memory.js';
 
 const telegramToken = process.env.TELEGRAM_BOT_TOKEN;
-const routerApiKey = process.env.OPENROUTER_API_KEY;
-const openaiBaseUrl = process.env.OPENAI_BASE_URL;
+const googleApiKeys = [process.env.GEMINI_API_KEY, process.env.GEMINI_API_KEY_2, process.env.GEMINI_API_KEY_3]
+  .filter((key): key is string => Boolean(key?.trim()));
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const startupChatId = process.env.STARTUP_CHAT_ID;
 
-if (!telegramToken || !routerApiKey || !openaiBaseUrl || !supabaseUrl || !supabaseServiceRoleKey) {
-  throw new Error('Set TELEGRAM_BOT_TOKEN, OPENROUTER_API_KEY, OPENAI_BASE_URL, SUPABASE_URL, and SUPABASE_SERVICE_ROLE_KEY in .env');
+if (!telegramToken || !googleApiKeys.length || !supabaseUrl || !supabaseServiceRoleKey) {
+  throw new Error('Set TELEGRAM_BOT_TOKEN, at least one GEMINI_API_KEY, SUPABASE_URL, and SUPABASE_SERVICE_ROLE_KEY in .env');
 }
 
 const bot = new Bot(telegramToken);
@@ -26,7 +26,7 @@ const unsolicitedMessageChance = 0.2;
 const unsolicitedDelayMinMs = 60_000;
 const unsolicitedDelayMaxMs = 5 * 60_000;
 const pillReaction = '💊';
-const aiModel = 'gemini/gemini-3.5-flash-lite';
+const aiModel = 'gemini-3.5-flash-lite';
 const systemPrompt = (
   await Promise.all(
     personalityFiles.map(async (file) => {
@@ -35,11 +35,28 @@ const systemPrompt = (
     }),
   )
 ).join('\n\n');
-const ai = new OpenAI({
-  baseURL: openaiBaseUrl,
-  apiKey: routerApiKey,
-  maxRetries: 1,
-});
+let nextGoogleApiKey = 0;
+
+async function createCompletion(params: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming) {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < googleApiKeys.length; attempt++) {
+    const keyIndex = (nextGoogleApiKey + attempt) % googleApiKeys.length;
+    try {
+      const result = await new OpenAI({
+        baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
+        apiKey: googleApiKeys[keyIndex],
+        maxRetries: 0,
+      }).chat.completions.create(params);
+      nextGoogleApiKey = keyIndex;
+      return result;
+    } catch (error) {
+      lastError = error;
+      if (!(error instanceof OpenAI.APIError) || ![401, 403, 404, 429].includes(error.status ?? 0)) throw error;
+      console.error(`Gemini API key ${keyIndex + 1} failed:`, describeError(error));
+    }
+  }
+  throw lastError;
+}
 
 bot.callbackQuery(/^call-setting:(\d+)$/u, async (ctx) => {
   await ctx.answerCallbackQuery();
@@ -132,7 +149,7 @@ function scheduleUnsolicitedMessage(chatId: string, recentMessage: string) {
         if (recentResult.error) throw recentResult.error;
         const recentContext = (recentResult.data ?? []).reverse()
           .map(({ author_name, content }) => `${author_name}: ${content}`).join('\n');
-        const result = await ai.chat.completions.create({
+        const result = await createCompletion({
           model: aiModel,
           messages: [
             {
@@ -212,8 +229,8 @@ async function refreshMemoryOnce(chatId: string) {
     knownPeople.push(...(data ?? []));
   }
 
-  const result = await ai.chat.completions.create({
-    model: 'gemini/gemini-3.5-flash-lite',
+  const result = await createCompletion({
+    model: aiModel,
     response_format: { type: 'json_object' },
     messages: [
       {
@@ -509,14 +526,14 @@ bot.on('message', async (ctx) => {
           ? [
             { type: 'text' as const, text: `${authorName}: ${messageText}` },
             ...(photo ? [{ type: 'image_url' as const, image_url: { url: `data:image/jpeg;base64,${(await getTelegramFile(ctx.api, photo.file_id)).toString('base64')}` } }] : []),
-            ...(voice ? [{ type: 'text' as const, text: `Voice transcription: ${await ai.audio.transcriptions.create({ file: new File([await getTelegramFile(ctx.api, voice.file_id)], 'voice.ogg', { type: voice.mime_type }), model: 'whisper-1' }).then(({ text }) => text)}` }] : []),
+            ...(voice ? [{ type: 'text' as const, text: `Transcribe this voice message and respond to it: ${Buffer.from(await getTelegramFile(ctx.api, voice.file_id)).toString('base64')}` }] : []),
           ]
           : `${authorName}: ${messageText}`
       },
     ];
     let rawAnswer: string | undefined;
     try {
-      const result = await ai.chat.completions.create({
+      const result = await createCompletion({
         model: aiModel,
         messages: prompt as OpenAI.Chat.Completions.ChatCompletionMessageParam[],
         max_tokens: 180,
