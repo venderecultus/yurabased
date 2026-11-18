@@ -11,6 +11,7 @@ const googleApiKeys = [process.env.GEMINI_API_KEY, process.env.GEMINI_API_KEY_2,
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const startupChatId = process.env.STARTUP_CHAT_ID;
+const adminUserId = '6015290021';
 
 if (!telegramToken || !googleApiKeys.length || !supabaseUrl || !supabaseServiceRoleKey) {
   throw new Error('Set TELEGRAM_BOT_TOKEN, at least one GEMINI_API_KEY, SUPABASE_URL, and SUPABASE_SERVICE_ROLE_KEY in .env');
@@ -36,6 +37,63 @@ const systemPrompt = (
   )
 ).join('\n\n');
 let nextGoogleApiKey = 0;
+
+type ChatSettings = { aggression: 0 | 30 | 60 | 100; profanity: boolean; stickers: boolean };
+const defaultChatSettings: ChatSettings = { aggression: 60, profanity: true, stickers: true };
+
+async function getChatSettings(chatId: string): Promise<ChatSettings> {
+  const { data, error } = await supabase.from('chat_settings').select('aggression, profanity, stickers').eq('chat_id', chatId).maybeSingle();
+  if (error) throw error;
+  return data ? { ...defaultChatSettings, ...data } : defaultChatSettings;
+}
+
+async function showSettings(ctx: { reply: (text: string, options?: any) => Promise<unknown> }, chatId: string) {
+  const settings = await getChatSettings(chatId);
+  await ctx.reply(`Настройки Юры · чат ${chatId}\nАгрессия: ${settings.aggression}%\nМаты: ${settings.profanity ? 'вкл' : 'выкл'}\nСтикеры: ${settings.stickers ? 'вкл' : 'выкл'}`, {
+    reply_markup: {
+      inline_keyboard: [
+        [0, 30, 60, 100].map((value) => ({ text: `${settings.aggression === value ? '✅ ' : ''}${value}%`, callback_data: `yura-setting:${chatId}:aggression:${value}` })),
+        [{ text: `Маты ${settings.profanity ? '✅' : '⬜'}`, callback_data: `yura-setting:${chatId}:profanity:${!settings.profanity}` }],
+        [{ text: `Стикеры ${settings.stickers ? '✅' : '⬜'}`, callback_data: `yura-setting:${chatId}:stickers:${!settings.stickers}` }],
+      ]
+    },
+  });
+}
+
+async function getKnownGroupChats() {
+  const chatIds = new Set<string>();
+  for (let offset = 0; ; offset += 1000) {
+    const { data, error } = await supabase.from('messages').select('chat_id').order('id', { ascending: false }).range(offset, offset + 999);
+    if (error) throw error;
+    for (const { chat_id } of data ?? []) {
+      if (String(chat_id).startsWith('-')) chatIds.add(String(chat_id));
+    }
+    if (!data || data.length < 1000) break;
+  }
+  chatIds.add('-1003650456339');
+  return Promise.all([...chatIds].map(async (id) => {
+    try {
+      const chat = await bot.api.getChat(id);
+      return { id, name: 'title' in chat && chat.title ? chat.title : id };
+    } catch (error) {
+      console.error(`Chat title lookup failed for ${id}:`, describeError(error));
+      return { id, name: id };
+    }
+  }));
+}
+
+bot.callbackQuery(/^yura-setting:(-?\d+):(open|aggression|profanity|stickers):([\w]+)$/u, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  if (String(ctx.from.id) !== adminUserId || ctx.chat?.type !== 'private') return;
+  const [, chatId, field, rawValue] = ctx.match;
+  if (!(await getKnownGroupChats()).some(({ id }) => id === chatId)) return;
+  if (field === 'open') { await showSettings(ctx, chatId); return; }
+  const value = field === 'aggression' ? Number(rawValue) : rawValue === 'true';
+  if (field === 'aggression' && ![0, 30, 60, 100].includes(value as number)) return;
+  const { error } = await supabase.from('chat_settings').upsert({ chat_id: chatId, [field]: value }, { onConflict: 'chat_id' });
+  if (error) { console.error('Chat settings update failed:', error); await ctx.reply('Не удалось сохранить настройку. Проверь таблицу chat_settings в Supabase.'); return; }
+  await showSettings(ctx, chatId);
+});
 
 async function createCompletion(params: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming) {
   let lastError: unknown;
@@ -93,12 +151,14 @@ bot.callbackQuery(/^call-setting:(\d+)$/u, async (ctx) => {
   const { data: members } = await supabase.from('people').select('user_id, name').eq('chat_id', chatId);
   const uniqueMembers = [...new Map((members ?? []).filter(({ user_id }) => user_id !== String(ctx.me.id))
     .map((item) => [item.user_id, item])).values()];
-  await ctx.editMessageReplyMarkup({ reply_markup: {
-    inline_keyboard: uniqueMembers.map(({ user_id: id, name }) => [{
-      text: `${disabledIds.has(id) ? '⬜' : '✅'} ${name}`.slice(0, 64),
-      callback_data: `call-setting:${id}`,
-    }]),
-  } });
+  await ctx.editMessageReplyMarkup({
+    reply_markup: {
+      inline_keyboard: uniqueMembers.map(({ user_id: id, name }) => [{
+        text: `${disabledIds.has(id) ? '⬜' : '✅'} ${name}`.slice(0, 64),
+        callback_data: `call-setting:${id}`,
+      }]),
+    }
+  });
 });
 
 function escapeHtml(value: string) {
@@ -343,6 +403,16 @@ bot.on('message', async (ctx) => {
   const mediaFile = photo ?? voice;
   const repliedToBot = message.reply_to_message?.from?.id === ctx.me.id;
 
+  if (text?.match(/^\/settings(?:@\w+)?(?:\s|$)/iu) && ctx.chat.type === 'private') {
+    if (String(ctx.from.id) !== adminUserId) { await ctx.reply('Команда доступна только администратору.'); return; }
+    let chats: { id: string; name: string }[];
+    try { chats = await getKnownGroupChats(); }
+    catch (error) { console.error('/settings chat lookup failed:', error); await ctx.reply('Не удалось загрузить чаты.'); return; }
+    if (!chats.length) { await ctx.reply('Пока нет чатов с сохранёнными сообщениями.'); return; }
+    await ctx.reply('Выбери чат для настройки:', { reply_markup: { inline_keyboard: chats.map(({ id, name }) => [{ text: name.slice(0, 64), callback_data: `yura-setting:${id}:open:0` }]) } });
+    return;
+  }
+
   if (text?.match(/^\/call(?:@\w+)?(?:\s|$)/iu)) {
     if (ctx.chat.type !== 'group' && ctx.chat.type !== 'supergroup') {
       await ctx.reply('работает только в группе', replyOptions);
@@ -485,6 +555,7 @@ bot.on('message', async (ctx) => {
   cancelUnsolicitedMessage(chatId);
   const timings: Record<string, number> = {};
   try {
+    const chatSettings = await getChatSettings(chatId);
     let stageStarted = performance.now();
     const { data: incomingMessage, error: incomingError } = await supabase.from('messages').insert({
       chat_id: chatId, user_id: userId, author_name: authorName, role: 'user', content: messageText,
@@ -520,7 +591,7 @@ bot.on('message', async (ctx) => {
     const positiveExamples = (positiveExamplesResult.data ?? []).map(({ content }) => `- ${content}`).join('\n') || '(none)';
     const negativeExamples = (negativeExamplesResult.data ?? []).map(({ content }) => `- ${content}`).join('\n') || '(none)';
     const prompt = [
-      { role: 'system' as const, content: `${systemPrompt}\n\nRecent context:\n${recentContext || '(empty)'}\n\nLong-term summary:\n${summaryResult.data?.summary ?? '(empty)'}\n\nKnown facts about this user:\n${knownFacts}\n\nExamples of Yura's answers people liked (imitate their tone and qualities, not exact wording):\n${positiveExamples}\n\nExamples of Yura's answers people disliked (avoid their tone and qualities):\n${negativeExamples}\n\nAvoid repeating the wording, insult, joke, or comeback from your recent answers. Respond freshly and match the group's current tone. If the user's message is genuinely hilarious, append [[PILL_REACTION]] at the very end; otherwise omit it.` },
+      { role: 'system' as const, content: `${systemPrompt}\n\nChat behavior settings: aggression ${chatSettings.aggression}% (0 = calm, 100 = maximally aggressive); profanity ${chatSettings.profanity ? 'allowed' : 'forbidden'}. Follow these settings.\n\nRecent context:\n${recentContext || '(empty)'}\n\nLong-term summary:\n${summaryResult.data?.summary ?? '(empty)'}\n\nKnown facts about this user:\n${knownFacts}\n\nExamples of Yura's answers people liked (imitate their tone and qualities, not exact wording):\n${positiveExamples}\n\nExamples of Yura's answers people disliked (avoid their tone and qualities):\n${negativeExamples}\n\nAvoid repeating the wording, insult, joke, or comeback from your recent answers. Respond freshly and match the group's current tone. If the user's message is genuinely hilarious, append [[PILL_REACTION]] at the very end; otherwise omit it.` },
       {
         role: 'user' as const, content: mediaFile
           ? [
@@ -558,7 +629,7 @@ bot.on('message', async (ctx) => {
       await ctx.api.setMessageReaction(ctx.chat.id, message.message_id, [{ type: 'emoji', emoji: pillReaction }])
         .catch((error) => console.error('Pill reaction failed:', error));
     }
-    if (Math.random() < stickerChance) {
+    if (chatSettings.stickers && Math.random() < stickerChance) {
       const sticker = stickers[Math.floor(Math.random() * stickers.length)];
       await ctx.replyWithSticker(sticker, replyOptions);
     }
