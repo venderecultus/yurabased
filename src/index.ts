@@ -737,10 +737,12 @@ await bot.start({
       return;
     }
 
+    console.log('Bot started; sending startup greeting:', { chat_id: startupChatId });
     try {
-      await bot.api.sendMessage(startupChatId, 'здарова.)');
+      const message = await bot.api.sendMessage(startupChatId, 'здарова.)');
+      console.log('Startup greeting sent:', { chat_id: startupChatId, message_id: message.message_id });
     } catch (error) {
-      console.error('Failed to send startup greeting:', error);
+      console.error('Failed to send startup greeting:', { chat_id: startupChatId, error: describeError(error) });
     }
   },
 });
