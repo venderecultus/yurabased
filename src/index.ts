@@ -399,6 +399,8 @@ async function getRecentContext(chatId: string, beforeMessageId: number) {
 bot.on('message', async (ctx) => {
   const message = ctx.message;
   if (!message) return;
+  const trace = { chat_id: String(ctx.chat.id), message_id: message.message_id, chat_type: ctx.chat.type };
+  console.log('Message received:', trace);
   const replyOptions = { reply_parameters: { message_id: message.message_id } };
   const text = 'text' in message ? message.text : undefined;
   const photo = 'photo' in message ? message.photo?.at(-1) : undefined;
@@ -548,6 +550,7 @@ bot.on('message', async (ctx) => {
   const pinged = explicitlyAddressed || (Boolean(mediaFile) && Math.random() < 0.05);
 
   if (!pinged) {
+    console.log('Message ignored (not addressed):', trace);
     scheduleUnsolicitedMessage(chatId, messageText);
     void saveUserMessage(chatId, userId, authorName, messageText)
       .catch((error) => console.error('Message save failed:', error));
@@ -558,13 +561,16 @@ bot.on('message', async (ctx) => {
   cancelUnsolicitedMessage(chatId);
   const timings: Record<string, number> = {};
   try {
+    console.log('Reply pipeline started:', trace);
     const chatSettings = await getChatSettings(chatId);
     let stageStarted = performance.now();
     const { data: incomingMessage, error: incomingError } = await supabase.from('messages').insert({
       chat_id: chatId, user_id: userId, author_name: authorName, role: 'user', content: messageText,
     }).select('id').single();
     if (incomingError) throw incomingError;
+    console.log('Incoming message stored:', { ...trace, db_message_id: incomingMessage.id });
     await refreshRecentContext(chatId);
+    console.log('Recent context refreshed:', trace);
     void refreshMemory(chatId).catch((error) => console.error('Background memory update failed:', error));
     await ctx.replyWithChatAction('typing').catch(() => undefined);
 
@@ -578,6 +584,7 @@ bot.on('message', async (ctx) => {
         .eq('answer_feedback.rating', 'negative').order('id', { ascending: false }).limit(3),
     ]);
     timings.memory = Math.round(performance.now() - stageStarted);
+    console.log('Context loaded:', { ...trace, duration_ms: timings.memory });
     if (summaryResult.error) console.error('Summary load failed:', summaryResult.error);
     if (factsResult.error) console.error('Facts load failed:', factsResult.error);
     if (positiveExamplesResult.error) console.error('Positive answer examples load failed:', positiveExamplesResult.error);
@@ -607,12 +614,14 @@ bot.on('message', async (ctx) => {
     ];
     let rawAnswer: string | undefined;
     try {
+      console.log('Model request started:', { ...trace, model: aiModel });
       const result = await createCompletion({
         model: aiModel,
         messages: prompt as OpenAI.Chat.Completions.ChatCompletionMessageParam[],
         max_tokens: 180,
       });
       rawAnswer = result.choices?.[0]?.message.content?.trim();
+      console.log('Model request completed:', { ...trace, duration_ms: Math.round(performance.now() - stageStarted), has_answer: Boolean(rawAnswer) });
     } catch (error) {
       if (!mediaFile) throw error;
       console.error('Media understanding unavailable:', describeError(error));
@@ -628,6 +637,7 @@ bot.on('message', async (ctx) => {
 
     stageStarted = performance.now();
     const sentMessage = await ctx.reply(answer, replyOptions);
+    console.log('Telegram reply sent:', { ...trace, reply_message_id: sentMessage.message_id });
     if (pillReactionRequested && ctx.from.id !== ctx.me.id) {
       await ctx.api.setMessageReaction(ctx.chat.id, message.message_id, [{ type: 'emoji', emoji: pillReaction }])
         .catch((error) => console.error('Pill reaction failed:', error));
@@ -649,6 +659,7 @@ bot.on('message', async (ctx) => {
 
     console.log('Reply timings (ms):', { ...timings, total: Math.round(performance.now() - requestStarted) });
   } catch (error) {
+    console.error('Reply pipeline failed at/after last logged stage:', trace);
     console.log('Failed reply timings (ms):', { ...timings, total: Math.round(performance.now() - requestStarted) });
     console.error('Message handling failed:', describeError(error));
     await ctx.reply('не смог ответить, глянь логи', replyOptions);
@@ -707,9 +718,18 @@ bot.on('message_reaction_count', async (ctx) => {
   }
 });
 
-bot.catch((error) => console.error('Telegram update failed:', error));
+bot.catch((error) => console.error('Telegram update failed:', {
+  chat_id: error.ctx.chat?.id,
+  update_id: error.ctx.update.update_id,
+  error: describeError(error.error),
+}));
+process.on('unhandledRejection', (error) => console.error('Unhandled promise rejection:', describeError(error)));
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught exception:', describeError(error));
+  process.exitCode = 1;
+});
 await bot.start({
-  drop_pending_updates: true,
+  drop_pending_updates: false,
   allowed_updates: ['message', 'callback_query', 'message_reaction', 'message_reaction_count'],
   onStart: async () => {
     if (!startupChatId) {
