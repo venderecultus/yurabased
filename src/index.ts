@@ -43,7 +43,10 @@ const defaultChatSettings: ChatSettings = { aggression: 60, profanity: true, sti
 
 async function getChatSettings(chatId: string): Promise<ChatSettings> {
   const { data, error } = await supabase.from('chat_settings').select('aggression, profanity, stickers').eq('chat_id', chatId).maybeSingle();
-  if (error) throw error;
+  if (error) {
+    console.error('Chat settings lookup failed; using defaults:', error);
+    return defaultChatSettings;
+  }
   return data ? { ...defaultChatSettings, ...data } : defaultChatSettings;
 }
 
