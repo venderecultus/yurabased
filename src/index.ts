@@ -702,9 +702,19 @@ bot.on('message', async (ctx) => {
     console.error('Reply pipeline failed at/after last logged stage:', trace);
     console.log('Failed reply timings (ms):', { ...timings, total: Math.round(performance.now() - requestStarted) });
     console.error('Message handling failed:', describeError(error));
-    await ctx.reply('не смог ответить, глянь логи', replyOptions);
     if (startupChatId) {
-      await bot.api.sendMessage(startupChatId, `не смог ответить в чате ${chatId}, глянь логи`)
+      let chatName = chatId;
+      try {
+        const failedChat = await bot.api.getChat(ctx.chat.id);
+        if ('title' in failedChat && failedChat.title) chatName = failedChat.title;
+        else if ('first_name' in failedChat) {
+          chatName = [failedChat.first_name, 'last_name' in failedChat ? failedChat.last_name : undefined]
+            .filter(Boolean).join(' ') || chatId;
+        }
+      } catch (lookupError) {
+        console.error('Failed to get failed chat name:', { chat_id: chatId, error: describeError(lookupError) });
+      }
+      await bot.api.sendMessage(startupChatId, `не смог ответить, глянь логи. Чат: ${chatName} (${chatId})`)
         .catch((notifyError) => console.error('Failed to notify startup chat about reply failure:', {
           chat_id: startupChatId,
           failed_chat_id: chatId,
