@@ -22,7 +22,7 @@ const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
 const messagesPerSummary = 200;
 const personalityFiles = ['identity.md', 'style.md', 'vocabulary.md', 'mindset.md', 'preferences.md', 'guardrails.md'];
 const stickers = JSON.parse(await readFile(new URL('../personality/stickers.json', import.meta.url), 'utf8')) as string[];
-const stickerChance = 0.15;
+const stickerChance = 0.02;
 const unsolicitedMessageChance = 0.2;
 const unsolicitedDelayMinMs = 60_000;
 const unsolicitedDelayMaxMs = 5 * 60_000;
@@ -58,6 +58,8 @@ async function showSettings(ctx: { reply: (text: string, options?: any) => Promi
         [0, 30, 60, 100].map((value) => ({ text: `${settings.aggression === value ? '✅ ' : ''}${value}%`, callback_data: `yura-setting:${chatId}:aggression:${value}` })),
         [{ text: `Маты ${settings.profanity ? '✅' : '⬜'}`, callback_data: `yura-setting:${chatId}:profanity:${!settings.profanity}` }],
         [{ text: `Стикеры ${settings.stickers ? '✅' : '⬜'}`, callback_data: `yura-setting:${chatId}:stickers:${!settings.stickers}` }],
+        [{ text: 'Просмотреть список участников', callback_data: `yura-setting:${chatId}:members:0` }],
+        [{ text: 'Просмотреть последние 20 сообщений', callback_data: `yura-setting:${chatId}:recent:0` }],
       ]
     },
   });
@@ -85,12 +87,36 @@ async function getKnownGroupChats() {
   }));
 }
 
-bot.callbackQuery(/^yura-setting:(-?\d+):(open|aggression|profanity|stickers):([\w]+)$/u, async (ctx) => {
+bot.callbackQuery(/^yura-setting:(-?\d+):(open|aggression|profanity|stickers|members|recent):([\w]+)$/u, async (ctx) => {
   await ctx.answerCallbackQuery();
   if (String(ctx.from.id) !== adminUserId || ctx.chat?.type !== 'private') return;
   const [, chatId, field, rawValue] = ctx.match;
   if (!(await getKnownGroupChats()).some(({ id }) => id === chatId)) return;
   if (field === 'open') { await showSettings(ctx, chatId); return; }
+  if (field === 'members') {
+    const { data, error } = await supabase.from('people').select('name').eq('chat_id', chatId).order('name');
+    if (error) { console.error('Settings member lookup failed:', error); await ctx.reply('Не удалось загрузить участников.'); return; }
+    const members = [...new Set((data ?? []).map(({ name }) => name))];
+    for (let offset = 0; offset < members.length || offset === 0; offset += 100) {
+      await ctx.reply(members.length ? `Участники чата:\n${members.slice(offset, offset + 100).join('\n')}` : 'Список участников пока пуст.');
+      if (!members.length) break;
+    }
+    return;
+  }
+  if (field === 'recent') {
+    const { data, error } = await supabase.from('messages').select('author_name, content').eq('chat_id', chatId)
+      .order('id', { ascending: false }).limit(20);
+    if (error) { console.error('Settings recent messages lookup failed:', error); await ctx.reply('Не удалось загрузить сообщения.'); return; }
+    const messages = (data ?? []).reverse().map(({ author_name, content }) => `${author_name}: ${content}`);
+    let chunk = '';
+    for (const line of messages.length ? messages : ['Сообщений пока нет.']) {
+      const next = `${chunk ? '\n' : ''}${line}`;
+      if (chunk.length + next.length > 3900) { await ctx.reply(chunk); chunk = line.slice(0, 3900); }
+      else chunk += next;
+    }
+    if (chunk) await ctx.reply(chunk);
+    return;
+  }
   const value = field === 'aggression' ? Number(rawValue) : rawValue === 'true';
   if (field === 'aggression' && ![0, 30, 60, 100].includes(value as number)) return;
   const { error } = await supabase.from('chat_settings').upsert({ chat_id: chatId, [field]: value }, { onConflict: 'chat_id' });
@@ -99,24 +125,38 @@ bot.callbackQuery(/^yura-setting:(-?\d+):(open|aggression|profanity|stickers):([
 });
 
 async function createCompletion(params: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming) {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < googleApiKeys.length; attempt++) {
+  const retryableStatuses = [408, 429, 500, 502, 503, 504];
+  const retryDeadline = Date.now() + 25_000;
+  let attempt = 0;
+  while (true) {
+    const remainingMs = retryDeadline - Date.now();
+    if (remainingMs <= 0) throw new Error('Gemini request timed out after 25 seconds');
     const keyIndex = (nextGoogleApiKey + attempt) % googleApiKeys.length;
     try {
       const result = await new OpenAI({
         baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
         apiKey: googleApiKeys[keyIndex],
         maxRetries: 0,
+        timeout: remainingMs,
       }).chat.completions.create(params);
       nextGoogleApiKey = keyIndex;
       return result;
     } catch (error) {
-      lastError = error;
-      if (!(error instanceof OpenAI.APIError) || ![401, 403, 404, 429].includes(error.status ?? 0)) throw error;
+      if (!(error instanceof OpenAI.APIError)) throw error;
+      const retryable = retryableStatuses.includes(error.status ?? 0);
+      const hasAnotherKey = attempt + 1 < googleApiKeys.length;
+      if (!retryable && ![401, 403, 404].includes(error.status ?? 0)) throw error;
       console.error(`Gemini API key ${keyIndex + 1} failed:`, describeError(error));
+      if (!retryable && !hasAnotherKey) throw error;
+      if (retryable) {
+        const remainingMs = retryDeadline - Date.now();
+        if (remainingMs <= 0) throw error;
+        const delayMs = Math.min(1_000 * 2 ** Math.min(attempt, 4), remainingMs);
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+      attempt++;
     }
   }
-  throw lastError;
 }
 
 bot.callbackQuery(/^call-setting:(\d+)$/u, async (ctx) => {
@@ -663,6 +703,14 @@ bot.on('message', async (ctx) => {
     console.log('Failed reply timings (ms):', { ...timings, total: Math.round(performance.now() - requestStarted) });
     console.error('Message handling failed:', describeError(error));
     await ctx.reply('не смог ответить, глянь логи', replyOptions);
+    if (startupChatId) {
+      await bot.api.sendMessage(startupChatId, `не смог ответить в чате ${chatId}, глянь логи`)
+        .catch((notifyError) => console.error('Failed to notify startup chat about reply failure:', {
+          chat_id: startupChatId,
+          failed_chat_id: chatId,
+          error: describeError(notifyError),
+        }));
+    }
   }
 
 });
