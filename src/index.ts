@@ -40,6 +40,20 @@ let nextGoogleApiKey = 0;
 
 type ChatSettings = { aggression: 0 | 30 | 60 | 100; profanity: boolean; stickers: boolean };
 const defaultChatSettings: ChatSettings = { aggression: 60, profanity: true, stickers: true };
+const cleanupCooldowns = new Map<string, number>();
+
+async function isTopicBlocked(chatId: string, threadId?: number) {
+  if (threadId === undefined) return false;
+  const { data, error } = await supabase.from('chat_topics').select('blocked')
+    .eq('chat_id', chatId).eq('thread_id', threadId).maybeSingle();
+  if (error) { console.error('Topic setting lookup failed:', error); return true; }
+  return data?.blocked === true;
+}
+
+async function rememberTopic(chatId: string, threadId: number, name: string) {
+  const { error } = await supabase.from('chat_topics').upsert({ chat_id: chatId, thread_id: threadId, name }, { onConflict: 'chat_id,thread_id', ignoreDuplicates: true });
+  if (error) console.error('Topic save failed:', error);
+}
 
 async function getChatSettings(chatId: string): Promise<ChatSettings> {
   const { data, error } = await supabase.from('chat_settings').select('aggression, profanity, stickers').eq('chat_id', chatId).maybeSingle();
@@ -52,12 +66,16 @@ async function getChatSettings(chatId: string): Promise<ChatSettings> {
 
 async function showSettings(ctx: { reply: (text: string, options?: any) => Promise<unknown> }, chatId: string) {
   const settings = await getChatSettings(chatId);
-  await ctx.reply(`Настройки Юры · чат ${chatId}\nАгрессия: ${settings.aggression}%\nМаты: ${settings.profanity ? 'вкл' : 'выкл'}\nСтикеры: ${settings.stickers ? 'вкл' : 'выкл'}`, {
+  const { data: topics, error } = await supabase.from('chat_topics').select('thread_id, name, blocked').eq('chat_id', chatId).order('thread_id');
+  if (error) console.error('Settings topic lookup failed:', error);
+  const topicButtons = (topics ?? []).map(({ thread_id, name, blocked }) => [{ text: `${blocked ? '⛔' : '✅'} ${name}`.slice(0, 64), callback_data: `yura-setting:${chatId}:topic${thread_id}:${!blocked}` }]);
+  await ctx.reply(`Настройки Юры · чат ${chatId}\nАгрессия: ${settings.aggression}%\nМаты: ${settings.profanity ? 'вкл' : 'выкл'}\nСтикеры: ${settings.stickers ? 'вкл' : 'выкл'}\nВетки (✅ — Юра пишет, ⛔ — запрещено):${topicButtons.length ? '' : '\nСписок пока пуст. Чтобы добавить ветку, отправь в ней /yura-topic название.'}`, {
     reply_markup: {
       inline_keyboard: [
         [0, 30, 60, 100].map((value) => ({ text: `${settings.aggression === value ? '✅ ' : ''}${value}%`, callback_data: `yura-setting:${chatId}:aggression:${value}` })),
         [{ text: `Маты ${settings.profanity ? '✅' : '⬜'}`, callback_data: `yura-setting:${chatId}:profanity:${!settings.profanity}` }],
         [{ text: `Стикеры ${settings.stickers ? '✅' : '⬜'}`, callback_data: `yura-setting:${chatId}:stickers:${!settings.stickers}` }],
+        ...topicButtons,
         [{ text: 'Просмотреть список участников', callback_data: `yura-setting:${chatId}:members:0` }],
         [{ text: 'Просмотреть последние 20 сообщений', callback_data: `yura-setting:${chatId}:recent:0` }],
       ]
@@ -87,12 +105,20 @@ async function getKnownGroupChats() {
   }));
 }
 
-bot.callbackQuery(/^yura-setting:(-?\d+):(open|aggression|profanity|stickers|members|recent):([\w]+)$/u, async (ctx) => {
+bot.callbackQuery(/^yura-setting:(-?\d+):(open|aggression|profanity|stickers|members|recent|topic\d+):([\w]+)$/u, async (ctx) => {
   await ctx.answerCallbackQuery();
   if (String(ctx.from.id) !== adminUserId || ctx.chat?.type !== 'private') return;
   const [, chatId, field, rawValue] = ctx.match;
   if (!(await getKnownGroupChats()).some(({ id }) => id === chatId)) return;
   if (field === 'open') { await showSettings(ctx, chatId); return; }
+  if (field.startsWith('topic')) {
+    const threadId = Number(field.slice(5));
+    if (!Number.isSafeInteger(threadId) || threadId < 1 || !['true', 'false'].includes(rawValue)) return;
+    const { error } = await supabase.from('chat_topics').update({ blocked: rawValue === 'true' }).eq('chat_id', chatId).eq('thread_id', threadId);
+    if (error) { console.error('Topic setting update failed:', error); await ctx.reply('Не удалось сохранить настройку ветки.'); return; }
+    await showSettings(ctx, chatId);
+    return;
+  }
   if (field === 'members') {
     const { data, error } = await supabase.from('people').select('name').eq('chat_id', chatId).order('name');
     if (error) { console.error('Settings member lookup failed:', error); await ctx.reply('Не удалось загрузить участников.'); return; }
@@ -234,7 +260,7 @@ function cancelUnsolicitedMessage(chatId: string) {
   unsolicitedTimers.delete(chatId);
 }
 
-function scheduleUnsolicitedMessage(chatId: string, recentMessage: string) {
+function scheduleUnsolicitedMessage(chatId: string, recentMessage: string, threadId?: number) {
   cancelUnsolicitedMessage(chatId);
   if (Math.random() >= unsolicitedMessageChance) return;
 
@@ -267,7 +293,8 @@ function scheduleUnsolicitedMessage(chatId: string, recentMessage: string) {
         });
         const answer = result.choices?.[0]?.message.content?.trim();
         if (!answer) return;
-        const sentMessage = await bot.api.sendMessage(chatId, answer);
+        if (await isTopicBlocked(chatId, threadId)) return;
+        const sentMessage = await bot.api.sendMessage(chatId, answer, threadId === undefined ? {} : { message_thread_id: threadId });
         const { error } = await supabase.from('messages').insert({
           chat_id: chatId,
           user_id: String(bot.botInfo.id),
@@ -440,6 +467,8 @@ bot.on('message', async (ctx) => {
   const message = ctx.message;
   if (!message) return;
   const trace = { chat_id: String(ctx.chat.id), message_id: message.message_id, chat_type: ctx.chat.type };
+  const threadId = message.message_thread_id;
+  if (threadId !== undefined) await rememberTopic(String(ctx.chat.id), threadId, (message as typeof message & { forum_topic_created?: { name: string } }).forum_topic_created?.name ?? `Ветка ${threadId}`);
   console.log('Message received:', trace);
   const replyOptions = { reply_parameters: { message_id: message.message_id } };
   const text = 'text' in message ? message.text : undefined;
@@ -447,6 +476,54 @@ bot.on('message', async (ctx) => {
   const voice = 'voice' in message ? message.voice : undefined;
   const mediaFile = photo ?? voice;
   const repliedToBot = message.reply_to_message?.from?.id === ctx.me.id;
+
+  const topicRegistration = text?.match(/^\/yura-topic(?:@\w+)?(?:\s+(.+))?\s*$/iu);
+  if (topicRegistration) {
+    if (threadId === undefined || (ctx.chat.type !== 'group' && ctx.chat.type !== 'supergroup')) {
+      console.error('/yura-topic must be used inside a forum topic:', trace);
+      return;
+    }
+    const topicName = topicRegistration[1]?.trim() || `Ветка ${threadId}`;
+    const { error } = await supabase.from('chat_topics').upsert({ chat_id: String(ctx.chat.id), thread_id: threadId, name: topicName, blocked: false }, { onConflict: 'chat_id,thread_id', ignoreDuplicates: true });
+    if (error) {
+      console.error('Topic registration failed:', error);
+    } else {
+      const notice = `Добавлена ветка «${topicName}» (chat ${ctx.chat.id}, thread ${threadId}).`;
+      if (!startupChatId) console.error('Topic was added, but STARTUP_CHAT_ID is not set:', notice);
+      else await bot.api.sendMessage(startupChatId, notice).catch((notifyError) => console.error('Topic registration notification failed:', notifyError));
+    }
+    return;
+  }
+  const topicBlocked = await isTopicBlocked(String(ctx.chat.id), threadId);
+
+  if (text && /^юра\s+подчищай\s*[!.]*$/iu.test(text.trim())) {
+    const chatId = String(ctx.chat.id);
+    const until = cleanupCooldowns.get(chatId) ?? 0;
+    if (until > Date.now()) { await ctx.reply(`команда на кулдауне ещё ${Math.ceil((until - Date.now()) / 1000)} сек.`, replyOptions); return; }
+    cleanupCooldowns.set(chatId, Date.now() + 5 * 60_000);
+    const { data: answers, error } = await supabase.from('messages').select('id, telegram_message_id')
+      .eq('chat_id', chatId).eq('role', 'assistant').not('telegram_message_id', 'is', null)
+      .order('id', { ascending: false }).limit(5);
+    if (error) { cleanupCooldowns.delete(chatId); console.error('Cleanup lookup failed:', error); await ctx.reply('не смог найти сообщения для удаления', replyOptions); return; }
+    let deleted = 0;
+    for (const answer of answers ?? []) {
+      try {
+        await ctx.api.deleteMessage(ctx.chat.id, Number(answer.telegram_message_id));
+        const { error: deleteError } = await supabase.from('messages').delete().eq('id', answer.id);
+        if (deleteError) console.error('Cleanup history delete failed:', deleteError);
+        deleted++;
+      } catch (deleteError) { console.error('Telegram cleanup delete failed:', deleteError); }
+    }
+    if (deleted) await refreshRecentContext(chatId).catch((refreshError) => console.error('Cleanup context refresh failed:', refreshError));
+    if (!topicBlocked) await ctx.reply(deleted ? `подчистил: удалено ${deleted} сообщений Юры` : 'не нашёл сообщений, которые могу удалить', replyOptions);
+    return;
+  }
+
+  if (topicBlocked) {
+    void saveUserMessage(String(ctx.chat.id), String(ctx.from.id), [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ') || String(ctx.from.id), text ?? '[media]')
+      .catch((error) => console.error('Blocked-topic message save failed:', error));
+    return;
+  }
 
   if (text?.match(/^\/settings(?:@\w+)?(?:\s|$)/iu) && ctx.chat.type === 'private') {
     if (String(ctx.from.id) !== adminUserId) { await ctx.reply('Команда доступна только администратору.'); return; }
@@ -591,7 +668,7 @@ bot.on('message', async (ctx) => {
 
   if (!pinged) {
     console.log('Message ignored (not addressed):', trace);
-    scheduleUnsolicitedMessage(chatId, messageText);
+    scheduleUnsolicitedMessage(chatId, messageText, threadId);
     void saveUserMessage(chatId, userId, authorName, messageText)
       .catch((error) => console.error('Message save failed:', error));
     return;
@@ -676,13 +753,14 @@ bot.on('message', async (ctx) => {
     }
 
     stageStarted = performance.now();
+    if (await isTopicBlocked(chatId, threadId)) return;
     const sentMessage = await ctx.reply(answer, replyOptions);
     console.log('Telegram reply sent:', { ...trace, reply_message_id: sentMessage.message_id });
     if (pillReactionRequested && ctx.from.id !== ctx.me.id) {
       await ctx.api.setMessageReaction(ctx.chat.id, message.message_id, [{ type: 'emoji', emoji: pillReaction }])
         .catch((error) => console.error('Pill reaction failed:', error));
     }
-    if (chatSettings.stickers && Math.random() < stickerChance) {
+    if (chatSettings.stickers && Math.random() < stickerChance && !(await isTopicBlocked(chatId, threadId))) {
       const sticker = stickers[Math.floor(Math.random() * stickers.length)];
       await ctx.replyWithSticker(sticker, replyOptions);
     }
