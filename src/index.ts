@@ -499,7 +499,7 @@ bot.on('message', async (ctx) => {
   if (text && /^юра\s+подчищай\s*[!.]*$/iu.test(text.trim())) {
     const chatId = String(ctx.chat.id);
     const until = cleanupCooldowns.get(chatId) ?? 0;
-    if (until > Date.now()) { await ctx.reply(`команда на кулдауне ещё ${Math.ceil((until - Date.now()) / 1000)} сек.`, replyOptions); return; }
+    if (until > Date.now()) { await ctx.reply(`подожди ещё ${Math.ceil((until - Date.now()) / 1000)} сек.`, replyOptions); return; }
     cleanupCooldowns.set(chatId, Date.now() + 5 * 60_000);
     const { data: answers, error } = await supabase.from('messages').select('id, telegram_message_id')
       .eq('chat_id', chatId).eq('role', 'assistant').not('telegram_message_id', 'is', null)
@@ -515,7 +515,7 @@ bot.on('message', async (ctx) => {
       } catch (deleteError) { console.error('Telegram cleanup delete failed:', deleteError); }
     }
     if (deleted) await refreshRecentContext(chatId).catch((refreshError) => console.error('Cleanup context refresh failed:', refreshError));
-    if (!topicBlocked) await ctx.reply(deleted ? `подчистил: удалено ${deleted} сообщений Юры` : 'не нашёл сообщений, которые могу удалить', replyOptions);
+    if (!topicBlocked) await ctx.reply(deleted ? `иче` : 'не нашёл сообщений, которые могу удалить', replyOptions);
     return;
   }
 
