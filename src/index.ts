@@ -108,7 +108,7 @@ async function getKnownGroupChats() {
 
 async function showPublishingSettings(ctx: { reply: (text: string, options?: any) => Promise<unknown> }) {
   const { data, error } = await supabase.from('publishing_channels').select('channel_id,title,enabled').order('title');
-  if (error) throw error;
+  if (error) throw new Error(`Supabase ${error.code ?? ''}: ${error.message}${error.details ? ` (${error.details})` : ''}`);
   await ctx.reply(`Управление Telegram-каналами\nСначала выбери канал, затем задай параметры командами в личке.\nДобавить: /tgc add @username\nИсточник: /pubsource @source\nШаблон: /pubtemplate Название | инструкция\nИнтервал: /pubinterval минуты\nШанс: /pubchance 0-100\n\nВыбери канал:`, {
     reply_markup: { inline_keyboard: [
       ...(data ?? []).map(({ channel_id, title, enabled }) => [{ text: `${enabled ? '✅' : '⏸'} ${title}`.slice(0, 64), callback_data: `pub:select:${channel_id}` }]),
@@ -394,7 +394,14 @@ function describeError(error: unknown) {
     const cause = error.cause instanceof Error ? ` cause=${error.cause.message}` : '';
     return `${error.name}: ${error.message}${error.status ? ` status=${error.status}` : ''}${cause}`;
   }
-  return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  if (error instanceof Error) return `${error.name}: ${error.message}`;
+  if (error && typeof error === 'object') {
+    const value = error as Record<string, unknown>;
+    const details = [value.description, value.message, value.error_code, value.code].filter((part) => part !== undefined).join(' ');
+    if (details) return details;
+    try { return JSON.stringify(error); } catch { return Object.prototype.toString.call(error); }
+  }
+  return String(error);
 }
 
 async function getTelegramFile(api: Bot['api'], fileId: string) {
@@ -692,27 +699,31 @@ bot.on('message', async (ctx) => {
 
   if (text?.match(/^\/tgc(?:@\w+)?(?:\s|$)/iu) && ctx.chat.type === 'private') {
     if (String(ctx.from.id) !== adminUserId) { await ctx.reply('Команда доступна только администратору.'); return; }
-    const add = text.match(/^\/tgc(?:@\w+)?\s+add\s+(.+)$/iu);
-    if (add) {
+    const addTgc = text.match(/^\/tgc(?:@\w+)?\s+add\s+(.+)$/iu);
+    if (addTgc) {
       try {
-        const chat = await bot.api.getChat(add[1].trim());
+        const chat = await bot.api.getChat(addTgc[1].trim());
         if (chat.type !== 'channel') throw new Error('Укажи Telegram-канал.');
         const member = await bot.api.getChatMember(chat.id, ctx.me.id);
         if (member.status !== 'administrator' && member.status !== 'creator') throw new Error('Сначала добавь бота администратором канала.');
         const channelId = String(chat.id);
         const { error } = await supabase.from('publishing_channels').upsert({ channel_id: channelId, title: chat.title, enabled: true }, { onConflict: 'channel_id' });
-        if (error) throw error;
+        if (error) throw new Error(`Supabase ${error.code ?? ''}: ${error.message}${error.details ? ` (${error.details})` : ''}`);
         const { error: settingsError } = await supabase.from('publishing_settings').upsert({ channel_id: channelId }, { onConflict: 'channel_id', ignoreDuplicates: true });
-        if (settingsError) throw settingsError;
+        if (settingsError) throw new Error(`Supabase ${settingsError.code ?? ''}: ${settingsError.message}${settingsError.details ? ` (${settingsError.details})` : ''}`);
         selectedPublishingChannelId = channelId;
         await ctx.reply(`Канал «${chat.title}» добавлен и выбран. Настройки: /tgc`);
-      } catch (error) { await ctx.reply(error instanceof Error ? error.message : String(error)); }
+      } catch (error) {
+        console.error('/tgc add failed:', error);
+        await ctx.reply(`Не удалось добавить канал: ${describeError(error)}`);
+      }
       return;
     }
-    await showPublishingSettings(ctx).catch(async (error) => {
-      console.error('/tgc failed:', error);
-      await ctx.reply('Не удалось загрузить каналы. Проверь, что SQL-миграция применена в Supabase.');
-    });
+    try { await showPublishingSettings(ctx); }
+    catch (error) {
+      console.error('/tgc list failed:', error);
+      await ctx.reply(`Не удалось загрузить каналы: ${describeError(error)}`);
+    }
     return;
   }
 
@@ -728,27 +739,32 @@ bot.on('message', async (ctx) => {
         const me = await bot.api.getChatMember(chat.id, ctx.me.id);
         if (me.status !== 'administrator' && me.status !== 'creator') throw new Error('Добавьте бота администратором в источник канала.');
         const dest = await getSelectedPublishingChannel();
-        if (!dest) throw new Error('Сначала добавьте канал назначения через /pubadd.');
-        await supabase.from('publishing_settings').upsert({ channel_id: dest, source_channel_id: String(chat.id) }, { onConflict: 'channel_id' });
+        if (!dest) throw new Error('Сначала добавьте канал назначения через /tgc add @username.');
+        const { error } = await supabase.from('publishing_settings').upsert({ channel_id: dest, source_channel_id: String(chat.id) }, { onConflict: 'channel_id' });
+        if (error) throw error;
         await ctx.reply(`Источник для ${dest}: ${chat.title}. Добавьте бота администратором источника; сохраняются новые посты.`); return;
       }
       if (interval) {
         const value = Number(interval[1]); if (!Number.isSafeInteger(value) || value < 1 || value > 525600) throw new Error('Интервал: от 1 до 525600 минут.');
-        const channelId = await getSelectedPublishingChannel(); if (!channelId) throw new Error('Сначала добавьте канал через /pubadd.');
-        await supabase.from('publishing_settings').upsert({ channel_id: channelId, interval_minutes: value }, { onConflict: 'channel_id' }); await ctx.reply(`Интервал сохранён для ${channelId}.`); return;
+        const channelId = await getSelectedPublishingChannel(); if (!channelId) throw new Error('Сначала добавьте канал через /tgc add @username.');
+        const { error } = await supabase.from('publishing_settings').upsert({ channel_id: channelId, interval_minutes: value }, { onConflict: 'channel_id' });
+        if (error) throw error;
+        await ctx.reply(`Интервал сохранён для ${channelId}.`); return;
       }
       if (chance) {
         const value = Number(chance[1]); if (!Number.isSafeInteger(value) || value < 0 || value > 100) throw new Error('Шанс должен быть от 0 до 100.');
-        const channelId = await getSelectedPublishingChannel(); if (!channelId) throw new Error('Сначала добавьте канал через /pubadd.');
-        await supabase.from('publishing_settings').upsert({ channel_id: channelId, probability: value }, { onConflict: 'channel_id' }); await ctx.reply(`Шанс сохранён для ${channelId}.`); return;
+        const channelId = await getSelectedPublishingChannel(); if (!channelId) throw new Error('Сначала добавьте канал через /tgc add @username.');
+        const { error } = await supabase.from('publishing_settings').upsert({ channel_id: channelId, probability: value }, { onConflict: 'channel_id' });
+        if (error) throw error;
+        await ctx.reply(`Шанс сохранён для ${channelId}.`); return;
       }
       if (template) {
-        const channelId = await getSelectedPublishingChannel(); if (!channelId) throw new Error('Сначала добавьте канал через /pubadd.');
+        const channelId = await getSelectedPublishingChannel(); if (!channelId) throw new Error('Сначала добавьте канал через /tgc add @username.');
         const { error } = await supabase.from('publishing_templates').upsert({ channel_id: channelId, name: template[1].trim(), prompt: template[2].trim(), enabled: true }, { onConflict: 'channel_id,name' });
         if (error) throw error;
         await ctx.reply('Шаблон сохранён.'); return;
       }
-    } catch (error) { await ctx.reply(error instanceof Error ? error.message : String(error)); return; }
+    } catch (error) { console.error('Publishing settings update failed:', error); await ctx.reply(describeError(error)); return; }
   }
 
   if (text?.match(/^\/call(?:@\w+)?(?:\s|$)/iu)) {
