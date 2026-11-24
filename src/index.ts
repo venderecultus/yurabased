@@ -140,11 +140,12 @@ async function showPublishingChannel(ctx: { reply: (text: string, options?: any)
 }
 
 async function generatePublishingPost(channelId: string, destinationId: string, mode: 'manual' | 'automatic') {
-  const [{ data: settings }, { data: templates }, { data: sources }] = await Promise.all([
+  const [{ data: settings }, { data: templates }] = await Promise.all([
     supabase.from('publishing_settings').select('source_channel_id').eq('channel_id', channelId).maybeSingle(),
     supabase.from('publishing_templates').select('id,name,prompt').eq('channel_id', channelId).eq('enabled', true),
-    supabase.from('publishing_source_posts').select('photo_file_id,caption').eq('channel_id', channelId).not('photo_file_id', 'is', null).order('created_at', { ascending: false }).limit(20),
   ]);
+  const { data: sources } = await supabase.from('publishing_source_posts').select('photo_file_id,caption')
+    .eq('channel_id', settings?.source_channel_id ?? '').not('photo_file_id', 'is', null).order('created_at', { ascending: false }).limit(20);
   if (!settings?.source_channel_id || !templates?.length || !sources?.length) throw new Error('Нужен источник, включённый шаблон и хотя бы один новый пост с картинкой в источнике.');
   const source = sources[Math.floor(Math.random() * sources.length)];
   const template = templates[Math.floor(Math.random() * templates.length)];
