@@ -109,7 +109,7 @@ async function getKnownGroupChats() {
 async function showPublishingSettings(ctx: { reply: (text: string, options?: any) => Promise<unknown> }) {
   const { data, error } = await supabase.from('publishing_channels').select('channel_id,title,enabled').order('title');
   if (error) throw error;
-  await ctx.reply(`Каналы для публикаций\nДобавить: /pubadd @username\nСначала выбери канал, затем задай параметры командами в личке.\nИсточник: /pubsource @source\nШаблон: /pubtemplate Название | инструкция\nИнтервал: /pubinterval минуты\nШанс: /pubchance 0-100\n\nВыбери канал:`, {
+  await ctx.reply(`Управление Telegram-каналами\nСначала выбери канал, затем задай параметры командами в личке.\nДобавить: /tgc add @username\nИсточник: /pubsource @source\nШаблон: /pubtemplate Название | инструкция\nИнтервал: /pubinterval минуты\nШанс: /pubchance 0-100\n\nВыбери канал:`, {
     reply_markup: { inline_keyboard: [
       ...(data ?? []).map(({ channel_id, title, enabled }) => [{ text: `${enabled ? '✅' : '⏸'} ${title}`.slice(0, 64), callback_data: `pub:select:${channel_id}` }]),
       [{ text: '➕ Добавить канал', callback_data: 'pub:addhelp' }],
@@ -168,7 +168,8 @@ bot.callbackQuery(/^pub:(.+)$/u, async (ctx) => {
   if (String(ctx.from.id) !== adminUserId || ctx.chat?.type !== 'private') return;
   const [action, ...args] = ctx.match[1].split(':');
   try {
-    if (action === 'list' || action === 'addhelp') { await showPublishingSettings(ctx); return; }
+    if (action === 'list') { await showPublishingSettings(ctx); return; }
+    if (action === 'addhelp') { await ctx.reply('Добавь канал командой: /tgc add @username'); return; }
     const id = args[0];
     if (action === 'select') { selectedPublishingChannelId = id; await showPublishingChannel(ctx, id); return; }
     if (action === 'publish' || action === 'cancel') {
@@ -681,7 +682,6 @@ bot.on('message', async (ctx) => {
 
   if (text?.match(/^\/settings(?:@\w+)?(?:\s|$)/iu) && ctx.chat.type === 'private') {
     if (String(ctx.from.id) !== adminUserId) { await ctx.reply('Команда доступна только администратору.'); return; }
-    await showPublishingSettings(ctx).catch((error) => console.error('/settings publishing list failed:', error));
     let chats: { id: string; name: string }[];
     try { chats = await getKnownGroupChats(); }
     catch (error) { console.error('/settings chat lookup failed:', error); await ctx.reply('Не удалось загрузить чаты.'); return; }
@@ -690,24 +690,38 @@ bot.on('message', async (ctx) => {
     return;
   }
 
+  if (text?.match(/^\/tgc(?:@\w+)?(?:\s|$)/iu) && ctx.chat.type === 'private') {
+    if (String(ctx.from.id) !== adminUserId) { await ctx.reply('Команда доступна только администратору.'); return; }
+    const add = text.match(/^\/tgc(?:@\w+)?\s+add\s+(.+)$/iu);
+    if (add) {
+      try {
+        const chat = await bot.api.getChat(add[1].trim());
+        if (chat.type !== 'channel') throw new Error('Укажи Telegram-канал.');
+        const member = await bot.api.getChatMember(chat.id, ctx.me.id);
+        if (member.status !== 'administrator' && member.status !== 'creator') throw new Error('Сначала добавь бота администратором канала.');
+        const channelId = String(chat.id);
+        const { error } = await supabase.from('publishing_channels').upsert({ channel_id: channelId, title: chat.title, enabled: true }, { onConflict: 'channel_id' });
+        if (error) throw error;
+        const { error: settingsError } = await supabase.from('publishing_settings').upsert({ channel_id: channelId }, { onConflict: 'channel_id', ignoreDuplicates: true });
+        if (settingsError) throw settingsError;
+        selectedPublishingChannelId = channelId;
+        await ctx.reply(`Канал «${chat.title}» добавлен и выбран. Настройки: /tgc`);
+      } catch (error) { await ctx.reply(error instanceof Error ? error.message : String(error)); }
+      return;
+    }
+    await showPublishingSettings(ctx).catch(async (error) => {
+      console.error('/tgc failed:', error);
+      await ctx.reply('Не удалось загрузить каналы. Проверь, что SQL-миграция применена в Supabase.');
+    });
+    return;
+  }
+
   if (ctx.chat.type === 'private' && String(ctx.from.id) === adminUserId) {
-    const add = text?.match(/^\/pubadd(?:@\w+)?\s+(.+)$/iu);
     const source = text?.match(/^\/pubsource(?:@\w+)?\s+(.+)$/iu);
     const interval = text?.match(/^\/pubinterval(?:@\w+)?\s+(\d+)$/iu);
     const chance = text?.match(/^\/pubchance(?:@\w+)?\s+(\d+)$/iu);
     const template = text?.match(/^\/pubtemplate(?:@\w+)?\s+([^|]+)\|\s*(.+)$/iu);
     try {
-      if (add) {
-        const chat = await bot.api.getChat(add[1].trim());
-        if (chat.type !== 'channel') throw new Error('Укажите Telegram-канал.');
-        const me = await bot.api.getChatMember(chat.id, ctx.me.id);
-        if (me.status !== 'administrator' && me.status !== 'creator') throw new Error('Сначала добавьте бота администратором канала.');
-        const id = String(chat.id);
-        const { error } = await supabase.from('publishing_channels').upsert({ channel_id: id, title: chat.title, enabled: true }, { onConflict: 'channel_id' });
-        if (error) throw error;
-        await supabase.from('publishing_settings').upsert({ channel_id: id }, { onConflict: 'channel_id', ignoreDuplicates: true });
-        await ctx.reply(`Добавлен канал «${chat.title}». Открой /settings и выбери его.`); return;
-      }
       if (source) {
         const chat = await bot.api.getChat(source[1].trim());
         if (chat.type !== 'channel') throw new Error('Источник должен быть каналом.');
